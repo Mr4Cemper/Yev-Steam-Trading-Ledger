@@ -66,9 +66,9 @@ BACKUP_KEEP = 10                 # сколько последних ежедн�
 BACKUP_PREFIX = "deals.db."      # имя копии: deals.db.YYYY-MM-DD.bak
 BACKUP_SUFFIX = ".bak"
 
-DEFAULT_DEPOSIT_PROFIT = 50.0   # чистый плюс пополнения Steam, %
+DEFAULT_DEPOSIT_PROFIT = 48.0   # чистый плюс пополнения Steam, %
 DEFAULT_SALES_FEE = 2.0         # комиссия сайта за продажу, %
-DEFAULT_RATE = 44.44            # сколько ₴ в 1 $
+DEFAULT_RATE = 45.05            # сколько ₴ в 1 $
 
 # Поля ввода, видимые в журнале (два отдельных курса вместо одного).
 INPUT_COLUMNS = [
@@ -352,28 +352,72 @@ def _manual_backup_path(moment):
     return BACKUP_DIR / f"{BACKUP_PREFIX}{ts}{BACKUP_SUFFIX}"
 
 
+def _backup_sort_key(path):
+    """Ключ хронологической сортировки бэкапа по РАЗОБРАННОМУ имени.
+
+    Имя имеет вид deals.db.YYYY-MM-DD[.bak] (ежедневный) или
+    deals.db.YYYY-MM-DD_HH-MM-SS[_N][.bak] (ручной, N — суффикс коллизии).
+    Возвращает кортеж (метка_времени, числовой_суффикс), чтобы порядок совпадал
+    с реальной хронологией независимо от ширины суффикса (_2 vs _10 vs _100):
+    числовой суффикс сравнивается как ЧИСЛО, а не как строка. Ежедневный снимок
+    (без времени) считается «началом дня» (00:00:00) с суффиксом 0.
+    """
+    stem = path.name[len(BACKUP_PREFIX):]
+    if stem.endswith(BACKUP_SUFFIX):
+        stem = stem[:-len(BACKUP_SUFFIX)]
+    # Отделяем числовой суффикс коллизии, если он есть (последний _<число>).
+    suffix_num = 0
+    core = stem
+    if "_" in stem:
+        head, _, tail = stem.rpartition("_")
+        if tail.isdigit() and head:  # это суффикс коллизии, а не часть времени
+            # Но время тоже содержит '_' (дата_время). Суффикс коллизии — это
+            # ДОПОЛНИТЕЛЬНЫЙ _<число> ПОСЛЕ HH-MM-SS. Распознаём по длине головы.
+            # core должен быть либо 'YYYY-MM-DD', либо 'YYYY-MM-DD_HH-MM-SS'.
+            if head.count("_") in (0, 1):
+                core, suffix_num = head, int(tail)
+    # core -> сопоставимая метка: ежедневный (только дата) дополняем временем.
+    if "_" in core:
+        ts = core  # 'YYYY-MM-DD_HH-MM-SS'
+    else:
+        ts = core + "_00-00-00"  # ежедневный снимок = начало дня
+    return (ts, suffix_num)
+
+
 def list_backups():
     """Список существующих файлов бэкапов, новейшие первыми.
 
-    Имена с одной датой (ежедневные) и с датой-временем (ручные) сортируются
-    лексикографически по ISO-метке, что совпадает с хронологией.
+    Сортировка — по разобранному ключу (метка времени + числовой суффикс), а не
+    по строке имени, поэтому хронология сохраняется при любом числе коллизий в
+    одну секунду (_2, _10, _100 сравниваются как числа).
     """
     if not BACKUP_DIR.exists():
         return []
     files = [p for p in BACKUP_DIR.glob(f"{BACKUP_PREFIX}*{BACKUP_SUFFIX}") if p.is_file()]
-    return sorted(files, key=lambda p: p.name, reverse=True)
+    return sorted(files, key=_backup_sort_key, reverse=True)
 
 
 def prune_backups(keep=BACKUP_KEEP):
-    """Оставляет только последние keep копий (любых — ежедневных и ручных).
+    """Оставляет последние keep копий, но ВСЕГДА сохраняет сегодняшний ежедневный
+    снимок (его нельзя вытеснить ручными копиями).
 
     Возвращает число удалённых файлов. Ошибки удаления отдельных файлов
     игнорируются (бэкап не должен мешать работе приложения).
     """
+    protected = _daily_backup_path(date.today())  # ежедневный снимок за сегодня
+    all_backups = list_backups()                  # новейшие первыми
+    # Кандидаты на хранение: keep новейших. Если сегодняшний daily не попал в них
+    # (например, сделано много ручных копий за сегодня), всё равно его защищаем.
+    keep_set = set(all_backups[:keep])
+    if protected.exists():
+        keep_set.add(protected)
+
     removed = 0
-    for old in list_backups()[keep:]:
+    for p in all_backups:
+        if p in keep_set:
+            continue
         try:
-            old.unlink()
+            p.unlink()
             removed += 1
         except OSError:
             pass
@@ -431,6 +475,21 @@ def make_backup(force=False, manual=False):
 
         if manual:
             target = _manual_backup_path(datetime.now())
+            # Защита от совпадения по секунде: если файл с таким именем уже есть
+            # (две копии в одну и ту же секунду), добавляем числовой суффикс,
+            # чтобы вторая копия не затёрла первую.
+            if target.exists():
+                stem = target.name[:-len(BACKUP_SUFFIX)]
+                n = 2
+                while True:
+                    # Нулевое заполнение (_02, _03 … _10, _11), чтобы лексикографи-
+                    # ческая сортировка совпадала с хронологией даже при >9 копий
+                    # в одну и ту же секунду.
+                    cand = BACKUP_DIR / f"{stem}_{n:02d}{BACKUP_SUFFIX}"
+                    if not cand.exists():
+                        target = cand
+                        break
+                    n += 1
         else:
             target = _daily_backup_path(date.today())
             if target.exists() and not force:
@@ -459,7 +518,11 @@ def _normalize_deal(d):
 
     Про курсы:
         * курс покупки восстанавливается из старого единого ключа uah_per_usd
-          (обратная совместимость) или из курса продажи, если задан только он;
+          (обратная совместимость с миграцией одно-курсовой схемы);
+        * курс покупки НЕ выдумывается из курса продажи: если реальный курс
+          покупки неизвестен, он остаётся 0 (пустым), а долларовая себестоимость
+          считается неопределённой. Это честнее, чем подменять историческую
+          себестоимость курсом на момент продажи и тихо её искажать;
         * курс продажи для ОТКРЫТОЙ партии НЕ выдумывается и остаётся 0 (пустым):
           так его нельзя по ошибке принять за реальный курс будущей продажи. Курс
           продажи подставляется (из курса покупки) только если партия ПРОДАНА, а
@@ -468,16 +531,14 @@ def _normalize_deal(d):
     sold_flag = _to_bool(d.get("sold"))
     buy_rate = max(0.0, _to_float(d.get("buy_uah_per_usd"), 0.0))
     sell_rate = max(0.0, _to_float(d.get("sell_uah_per_usd"), 0.0))
-    # Обратная совместимость: старый единый ключ uah_per_usd.
+    # Обратная совместимость: старый единый ключ uah_per_usd (миграция схемы).
     legacy = max(0.0, _to_float(d.get("uah_per_usd"), 0.0))
     if buy_rate == 0.0 and legacy > 0:
         buy_rate = legacy
     if sell_rate == 0.0 and legacy > 0 and sold_flag:
         sell_rate = legacy
-    # Если задан только курс продажи — это и есть курс покупки (миграция/ввод).
-    if buy_rate == 0.0 and sell_rate > 0:
-        buy_rate = sell_rate
     # Курс продажи заполняем из курса покупки ТОЛЬКО для проданных партий.
+    # Обратное (курс покупки из курса продажи) НЕ делаем — см. docstring.
     if sold_flag and sell_rate == 0.0 and buy_rate > 0:
         sell_rate = buy_rate
     # Для открытых партий все поля продажи очищаются: курс, дата, цена, комиссия.
@@ -496,7 +557,12 @@ def _normalize_deal(d):
         "item_name": str(_num(d.get("item_name"), "") or "").strip(),
         "buy_date": _to_iso(d.get("buy_date", "")),
         "steam_buy_price": max(0.0, _to_float(d.get("steam_buy_price"), 0.0)),
-        "quantity": max(1, _to_int(d.get("quantity"), 1)),
+        # Количество НЕ принуждаем к 1: пустое/мусор -> 0 (через _to_int с дефолтом
+        # 0), чтобы битая запись (0 или отрицательное) сохранялась как есть и
+        # оставалась видимой ошибкой, а не подменялась молча на 1 при сохранении.
+        # validate_deals предупреждает о quantity<1, а сводка исключает такие
+        # строки из итогов. Защита от деления/умножения на мусор — в compute_deal.
+        "quantity": _to_int(d.get("quantity"), 0),
         "deposit_profit_pct": _to_float(d.get("deposit_profit_pct"), 0.0),
         "buy_uah_per_usd": buy_rate,
         "sold": 1 if sold_flag else 0,
@@ -695,13 +761,20 @@ def diff_editor_state(original_deals, editor_state):
     # такую строку как новую вставку, а не отбрасываем её.
     updates = []
     edited_as_inserts = []
+    cleared_delete_ids = []
     for pos, changes in edited.items():
         pos = int(pos)
         if 0 <= pos < len(original_deals):
             base = dict(original_deals[pos])
             base.update(changes)  # перезаписываем только изменённые поля
             base["id"] = int(original_deals[pos]["id"])
-            updates.append(base)
+            # Если существующую строку полностью очистили (не осталось ни названия,
+            # ни цены, ни данных продажи, ни курса, ни отметки «Продано»), это
+            # намерение УДАЛИТЬ её, а не сохранить пустой «призрак» с количеством 1.
+            if not _meaningful_row(base):
+                cleared_delete_ids.append(int(original_deals[pos]["id"]))
+            else:
+                updates.append(base)
         else:
             # Правка строки за пределами исходных данных = добавленная строка.
             if _meaningful_row(changes):
@@ -714,24 +787,30 @@ def diff_editor_state(original_deals, editor_state):
             inserts.append(row)
     inserts.extend(edited_as_inserts)
 
+    # Очищенные существующие строки удаляем (без дублей с явными удалениями).
+    for did in cleared_delete_ids:
+        if did not in delete_ids:
+            delete_ids.append(did)
+
     return updates, inserts, delete_ids
 
 
 def _meaningful_row(row):
     """True, если в строке есть осмысленная сделка.
 
-    Критерий шире прежнего: строка считается заполненной, если задано НАЗВАНИЕ,
-    либо положительная цена покупки, либо указано количество > 1, либо есть
-    данные продажи (дата/цена), либо проставлен любой курс. Это защищает от
-    случайного удаления «бесплатных» дропов (цена 0) при наличии других данных.
+    Строка считается заполненной, если задано НАЗВАНИЕ, либо положительная цена
+    покупки, либо есть данные продажи (дата/цена), либо проставлен любой курс.
+    Ни количество, ни одна лишь галочка «Продано» сами по себе строку осмысленной
+    не делают: это характеристики реальной сделки, а не свидетельство её наличия.
+    Поэтому пустая строка, где случайно тронули только количество или только
+    чекбокс «Продано», не превращается в фантомную сделку. «Бесплатные» дропы
+    (цена 0) при наличии названия по-прежнему сохраняются.
     """
     name = str(_num(row.get("item_name"), "") or "").strip()
     price = _to_float(row.get("steam_buy_price"), 0.0)
-    qty = _to_int(row.get("quantity"), 1)
     has_sale = (not _is_blank(row.get("sell_date"))) or _to_float(row.get("site_sell_price"), 0.0) > 0
     has_rate = _to_float(row.get("buy_uah_per_usd"), 0.0) > 0 or _to_float(row.get("sell_uah_per_usd"), 0.0) > 0
-    sold_flag = _to_bool(row.get("sold"))
-    return bool(name) or price > 0 or qty > 1 or has_sale or has_rate or sold_flag
+    return bool(name) or price > 0 or has_sale or has_rate
 
 
 # ===========================================================================
@@ -747,8 +826,13 @@ def validate_deals(deals):
           заполненные продажи;
         * заполнены данные продажи, но партия не отмечена «Продано»;
         * дата продажи раньше даты покупки;
-        * партия с нулевым/пустым курсом покупки (долларовые суммы будут неверны).
+        * дата покупки или продажи в будущем (вероятная опечатка);
+        * партия с нулевым/пустым курсом покупки (долларовые суммы будут неверны);
+        * проданная партия без курса продажи И без курса покупки (нет даже
+          запасного курса для пересчёта выручки). Если курс покупки есть, он
+          служит запасным курсом продажи, и предупреждение не выдаётся.
     """
+    today = date.today()
     warnings = []
     for d in deals:
         name = (str(d.get("item_name") or "").strip()) or "без названия"
@@ -771,11 +855,22 @@ def validate_deals(deals):
         sd = _parse_iso(d.get("sell_date"))
         if bd and sd and sd < bd:
             warnings.append(f"«{name}»: дата продажи ({sd.isoformat()}) раньше даты покупки ({bd.isoformat()}).")
+        # Даты из будущего — вероятная опечатка.
+        if bd and bd > today:
+            warnings.append(f"«{name}»: дата покупки ({bd.isoformat()}) в будущем — проверь дату.")
+        if sd and sd > today:
+            warnings.append(f"«{name}»: дата продажи ({sd.isoformat()}) в будущем — проверь дату.")
 
-        if _to_float(d.get("buy_uah_per_usd")) <= 0:
+        buy_rate = _to_float(d.get("buy_uah_per_usd"))
+        sell_rate = _to_float(d.get("sell_uah_per_usd"))
+        if buy_rate <= 0:
             warnings.append(f"«{name}»: не задан курс покупки (₴/$) — долларовые суммы будут некорректны.")
-        if sold and _to_float(d.get("sell_uah_per_usd")) <= 0:
-            warnings.append(f"«{name}»: продано, но не задан курс продажи (₴/$) — выручка в ₴ будет неверной.")
+        # Про курс продажи предупреждаем, только если нет и курса покупки: при
+        # наличии курса покупки он используется как запасной, и выручка считается
+        # корректно — ругаться не на что (иначе это ложный шум на старых записях).
+        if sold and sell_rate <= 0 and buy_rate <= 0:
+            warnings.append(f"«{name}»: продано, но не задан ни курс продажи, ни курс покупки (₴/$) — "
+                            "выручку в ₴ не на что пересчитать.")
 
         # Проверки уже сохранённых «мусорных» значений (например, после ручных
         # правок или из старой базы): количество, отрицательные суммы, проценты.
@@ -885,26 +980,43 @@ def build_dataframe(deals):
             sales_fee_pct=d.get("sales_fee_pct", 0.0),
         )
         roi = calc["roi_pct"]
+        # Продажа считается ПОЛНОЙ, только если есть и цена, и дата продажи. Иначе
+        # (галочка «Продано» без цены/даты) прибыль в журнале НЕ показывается —
+        # чтобы число на экране не приняли за итог, который сводка всё равно не
+        # учитывает. Такая строка получает отдельный статус «Закрыта (неполная)».
+        sell_price_val = _to_float(d.get("site_sell_price"), 0.0)
+        sell_date_val = _parse_iso(d.get("sell_date"))
+        complete_sale = sold and sell_price_val > 0 and sell_date_val is not None
+        if sold and not complete_sale:
+            status = "Закрыта (неполная)"
+        elif sold:
+            status = "Закрыта"
+        else:
+            status = "Открыта"
+        # Долларовую прибыль показываем только при заданном курсе покупки: без
+        # него долларовая себестоимость = 0, и profit_usd был бы завышен (вся
+        # выручка). Гривневую прибыль показываем всегда (она от курса не зависит).
+        usd_defined = complete_sale and _to_float(d.get("buy_uah_per_usd")) > 0
         records.append({
             "_id": d.get("id"),
             "_lot_group": d.get("lot_group", ""),
             "item_name": d.get("item_name", ""),
             "buy_date": _parse_iso(d.get("buy_date")),
             "steam_buy_price": _to_float(d.get("steam_buy_price")),
-            "quantity": _to_int(d.get("quantity"), 1),
+            "quantity": _to_int(d.get("quantity"), 0),
             "deposit_profit_pct": _to_float(d.get("deposit_profit_pct")),
             "buy_uah_per_usd": _to_float(d.get("buy_uah_per_usd")),
             "sold": sold,
-            "sell_date": _parse_iso(d.get("sell_date")),
-            "site_sell_price": _to_float(d.get("site_sell_price")),
+            "sell_date": sell_date_val,
+            "site_sell_price": sell_price_val,
             "sales_fee_pct": _to_float(d.get("sales_fee_pct")),
             "sell_uah_per_usd": _to_float(d.get("sell_uah_per_usd")),
             "real_cost_uah": round(calc["real_cost_uah"], 2),
-            "profit_uah": round(calc["profit_uah"], 2) if sold else None,
-            "profit_usd": round(calc["profit_usd"], 2) if sold else None,
-            "roi_pct": round(roi, 1) if (sold and roi is not None) else None,
+            "profit_uah": round(calc["profit_uah"], 2) if complete_sale else None,
+            "profit_usd": round(calc["profit_usd"], 2) if usd_defined else None,
+            "roi_pct": round(roi, 1) if (complete_sale and roi is not None) else None,
             "holding_days": holding_days(d.get("buy_date"), d.get("sell_date")),
-            "status": "Закрыта" if sold else "Открыта",
+            "status": status,
         })
 
     columns = ["_id", "_lot_group"] + INPUT_COLUMNS + COMPUTED_COLUMNS
@@ -955,6 +1067,15 @@ def lot_label(d):
     return (f"#{d.get('id')} · {d.get('item_name') or 'без названия'} · "
             f"{_to_int(d.get('quantity'), 0)} шт · куплено {bdate} по "
             f"{_to_float(d.get('steam_buy_price')):.2f} ₴/шт")
+
+
+def lot_delete_label(d):
+    """Подпись партии для удаления: базовая подпись + статус (продано/остаток)."""
+    base = lot_label(d)
+    if _to_bool(d.get("sold")):
+        sdate = _to_iso(d.get("sell_date")) or "—"
+        return base + f" · ПРОДАНО {sdate} по {_to_float(d.get('site_sell_price')):.2f} $/шт"
+    return base + " · остаток на руках"
 
 
 def _delta_str(roi):
@@ -1155,12 +1276,51 @@ def render_data_checks(deals, label_suffix=""):
                        "совпадает с тем, что ты реально покупал — поправь количества в журнале.")
 
 
+def _filter_and_sort_deals(deals, query, sort_mode):
+    """Возвращает партии для отображения: фильтр по названию + сортировка.
+
+    ВАЖНО: порядок этого списка должен совпадать с порядком строк в редакторе,
+    потому что сохранение правок привязывает позицию строки к элементу этого
+    же списка (а через него — к стабильному id). Поэтому ровно этот список
+    передаётся и в build_dataframe, и в diff_editor_state.
+
+    query     — подстрока названия (регистронезависимо); пусто => без фильтра.
+    sort_mode — 'Дата (новые сверху)' | 'Дата (старые сверху)' |
+                'Название (А→Я)' | 'Название (Я→А)'.
+    """
+    q = (query or "").strip().lower()
+    if q:
+        view = [d for d in deals if q in (str(d.get("item_name") or "").lower())]
+    else:
+        view = list(deals)
+
+    def _name_key(d):
+        return (str(d.get("item_name") or "").strip().lower(), d.get("id", 0))
+
+    def _date_key(d):
+        return (_parse_iso(d.get("buy_date")) or date.min, d.get("id", 0))
+
+    if sort_mode == "Название (А→Я)":
+        view.sort(key=_name_key)
+    elif sort_mode == "Название (Я→А)":
+        view.sort(key=_name_key, reverse=True)
+    elif sort_mode == "Дата (старые сверху)":
+        view.sort(key=_date_key)
+    else:  # 'Дата (новые сверху)' — по умолчанию
+        view.sort(key=_date_key, reverse=True)
+    return view
+
+
 def render_ledger(deals):
     """Редактируемая таблица всех партий: правка любых полей и удаление строк.
 
     Сохранение — точечными UPDATE/INSERT/DELETE по стабильным id (id строк не
     меняются). Предупреждения и сверка показываются и по сохранённым данным, и
     по предварительному состоянию из текущих правок редактора.
+
+    Поиск и сортировка не влияют на сохранность данных: правки привязываются к
+    строке по её скрытому id, а не по позиции на экране, поэтому фильтрация и
+    смена порядка строк безопасны.
     """
     st.subheader("📒 Журнал партий")
 
@@ -1168,16 +1328,39 @@ def render_ledger(deals):
         st.info("Журнал пуст. Добавь первую покупку выше.")
         return
 
-    st.caption("Каждая строка — партия (часть покупки). Любое поле, включая количество и оба "
-               "курса, можно править прямо здесь; строки можно удалять (выдели строку → Delete). "
-               "Серые колонки считаются автоматически. После правок нажми «Сохранить изменения». "
-               "Правки ручные и не пересчитывают другие партии — сверяйся с блоком ниже.")
+    # --- Поиск по названию + сортировка ---
+    col_search, col_sort = st.columns([2, 1])
+    with col_search:
+        query = st.text_input("🔍 Поиск по названию предмета", value="",
+                              key="ledger_search",
+                              placeholder="например: AK-47 или Redline").strip()
+    with col_sort:
+        sort_mode = st.selectbox(
+            "Сортировка",
+            ["Дата (новые сверху)", "Дата (старые сверху)", "Название (А→Я)", "Название (Я→А)"],
+            index=0, key="ledger_sort")
 
-    df = build_dataframe(deals)
-    # Динамический ключ: при изменении числа строк (после добавления покупки/продажи)
-    # Streamlit пересоздаёт редактор, а не переиспользует устаревшее внутреннее
-    # состояние со смещёнными индексами строк.
-    editor_key = f"ledger_editor_{len(df)}"
+    view_deals = _filter_and_sort_deals(deals, query, sort_mode)
+
+    if query and not view_deals:
+        st.warning(f"По запросу «{query}» ничего не найдено. Очисти поиск, чтобы увидеть все партии.")
+        return
+    if query:
+        st.caption(f"Найдено партий: {len(view_deals)} из {len(deals)}. "
+                   "Правки в отфильтрованном виде сохраняются в правильные партии. "
+                   "⚠️ Несохранённые правки сбросятся при смене текста поиска или сортировки — "
+                   "сначала нажми «Сохранить изменения».")
+    else:
+        st.caption("Каждая строка — партия (часть покупки). Любое поле, включая количество и оба "
+                   "курса, можно править прямо здесь; строки можно удалять (выдели строку → Delete). "
+                   "Серые колонки считаются автоматически. После правок нажми «Сохранить изменения». "
+                   "Правки ручные и не пересчитывают другие партии — сверяйся с блоком ниже.")
+
+    df = build_dataframe(view_deals)
+    # Ключ редактора зависит от вида (число строк + поиск + сортировка): при смене
+    # вида Streamlit пересоздаёт виджет, а не тянет устаревшие позиции строк.
+    view_sig = f"{len(df)}_{query.lower()}_{sort_mode}"
+    editor_key = f"ledger_editor_{view_sig}"
     column_order = INPUT_COLUMNS + COMPUTED_COLUMNS  # _id и _lot_group скрыты
     edited_df = st.data_editor(
         df, column_config=column_config(), disabled=COMPUTED_COLUMNS,
@@ -1186,13 +1369,36 @@ def render_ledger(deals):
     )
 
     # Предварительная проверка по ТЕКУЩИМ правкам в редакторе (а не только по БД).
-    preview_deals = dataframe_to_preview_deals(edited_df)
+    preview_visible = dataframe_to_preview_deals(edited_df)
+
+    # Если активен поиск/сортировка, на экране лишь срез базы. Чтобы проверка
+    # охватывала ВСЕ партии (а не только видимые), накладываем правки с экрана
+    # поверх полного списка: видимые строки берём из предпросмотра (по id), а
+    # скрытые — из полной базы как есть. Новые строки (без id) добавляем тоже.
+    if query:
+        visible_by_id = {d["id"]: d for d in preview_visible if "id" in d}
+        visible_ids = set(visible_by_id)
+        view_ids = {d.get("id") for d in view_deals}
+        check_deals = []
+        for d in deals:
+            did = d.get("id")
+            if did in visible_by_id:
+                check_deals.append(visible_by_id[did])      # правленая версия
+            elif did in view_ids and did not in visible_ids:
+                continue  # видимая строка была удалена на экране — пропускаем
+            else:
+                check_deals.append(d)                        # скрытая строка как есть
+        check_deals.extend(d for d in preview_visible if "id" not in d)  # новые строки
+    else:
+        check_deals = preview_visible
 
     col_save, col_info = st.columns([1, 3])
     with col_save:
         if st.button("💾 Сохранить изменения", type="primary", use_container_width=True):
             state = st.session_state.get(editor_key, {})
-            updates, inserts, dels = diff_editor_state(deals, state)
+            # Диффим относительно ОТОБРАЖАЕМОГО среза в том же порядке — привязка
+            # позиция->id остаётся верной даже при поиске и сортировке.
+            updates, inserts, dels = diff_editor_state(view_deals, state)
             if not updates and not inserts and not dels:
                 st.info("Нет изменений для сохранения.")
             else:
@@ -1214,33 +1420,41 @@ def render_ledger(deals):
     with col_info:
         st.caption("Изменения в таблице не сохранятся, пока не нажата кнопка.")
 
-    # Сначала — проверка по тому, что СЕЙЧАС на экране (предпросмотр изменений).
-    render_data_checks(preview_deals, label_suffix="предпросмотр изменений на экране")
+    # Проверка охватывает ВСЮ базу (с учётом правок на экране), даже при активном
+    # поиске — иначе несоответствия в скрытых строках остались бы незамеченными.
+    check_label = "вся база, с учётом правок на экране" if query else "предпросмотр изменений на экране"
+    render_data_checks(check_deals, label_suffix=check_label)
 
 
 def dataframe_to_preview_deals(df):
     """Преобразует ТЕКУЩИЙ датафрейм редактора в список партий для предпросмотра.
 
-    Используется только для предварительной проверки/сверки (не для записи).
-    Сохраняет id, если он есть, чтобы сверка совпадала с журналом.
+    Используется только для предварительной проверки/сверки (НЕ для записи).
+    В отличие от записи, здесь поля продажи НЕ обнуляются при снятой галочке
+    «Продано»: иначе предпросмотр не смог бы предупредить о введённых данных
+    продажи без отметки (и пользователь молча потерял бы их при сохранении).
+    Значения только приводятся к корректным типам; смысл строки сохраняется.
+    Количество тоже НЕ «чинится» до 1: если в строке стоит 0 или мусор, оно
+    остаётся как есть (через _to_int с дефолтом 0 для пустых), чтобы проверка
+    данных могла предупредить о некорректном количестве, а не сгладить его молча.
     """
     deals = []
     for _, row in df.iterrows():
         if not _meaningful_row(row):
             continue
-        d = _normalize_deal({
-            "item_name": row.get("item_name"),
-            "buy_date": row.get("buy_date"),
-            "steam_buy_price": row.get("steam_buy_price"),
-            "quantity": row.get("quantity"),
-            "deposit_profit_pct": row.get("deposit_profit_pct"),
-            "buy_uah_per_usd": row.get("buy_uah_per_usd"),
-            "sold": row.get("sold"),
-            "sell_date": row.get("sell_date"),
-            "site_sell_price": row.get("site_sell_price"),
-            "sales_fee_pct": row.get("sales_fee_pct"),
-            "sell_uah_per_usd": row.get("sell_uah_per_usd"),
-        })
+        d = {
+            "item_name": str(_num(row.get("item_name"), "") or "").strip(),
+            "buy_date": _to_iso(row.get("buy_date", "")),
+            "steam_buy_price": max(0.0, _to_float(row.get("steam_buy_price"), 0.0)),
+            "quantity": _to_int(row.get("quantity"), 0),
+            "deposit_profit_pct": _to_float(row.get("deposit_profit_pct"), 0.0),
+            "buy_uah_per_usd": max(0.0, _to_float(row.get("buy_uah_per_usd"), 0.0)),
+            "sold": 1 if _to_bool(row.get("sold")) else 0,
+            "sell_date": _to_iso(row.get("sell_date", "")),
+            "site_sell_price": max(0.0, _to_float(row.get("site_sell_price"), 0.0)),
+            "sales_fee_pct": max(0.0, _to_float(row.get("sales_fee_pct"), 0.0)),
+            "sell_uah_per_usd": max(0.0, _to_float(row.get("sell_uah_per_usd"), 0.0)),
+        }
         if "_id" in row and not _is_blank(row.get("_id")):
             d["id"] = _to_int(row.get("_id"), 0)
         if "_lot_group" in row and not _is_blank(row.get("_lot_group")):
@@ -1262,28 +1476,43 @@ def render_summary(deals):
         return
 
     df = build_dataframe(deals)
-    # «Реализованными» считаем только ПОЛНЫЕ продажи: отмечены проданными и есть
-    # цена продажи. Неполные (галочка «Продано» без цены) в реализованную прибыль,
-    # ROI и win-rate не включаются — иначе одна случайная галочка исказила бы итог
-    # и расходилась бы с помесячным графиком (туда нужна ещё и дата продажи).
-    is_sold = df["status"] == "Закрыта"
+    # «Реализованными» считаем только ПОЛНЫЕ продажи: отмечены проданными, есть
+    # цена И дата продажи И корректное количество (≥1). Требование даты — чтобы
+    # общий итог и помесячный график охватывали ОДНИ И ТЕ ЖЕ строки. Битые строки
+    # (quantity<1) исключаются из ВСЕХ метрик, чтобы итог не считался по
+    # подменённым значениям (в расчёте количество форсится в 1, но в сводных
+    # цифрах такие строки участвовать не должны).
+    sold_mask = df["sold"] == True  # noqa: E712  (булева колонка)
     has_price = df["site_sell_price"].fillna(0) > 0
-    closed = df[is_sold & has_price]
-    incomplete = df[is_sold & ~has_price]
-    open_pos = df[df["status"] == "Открыта"]
+    has_date = df["sell_date"].notna()
+    valid_qty = df["quantity"].fillna(0) >= 1
+    has_buy_rate = df["buy_uah_per_usd"].fillna(0) > 0
+
+    closed = df[sold_mask & has_price & has_date & valid_qty]
+    # Долларовые итоги считаем ТОЛЬКО по строкам с заданным курсом покупки: без
+    # него долларовая себестоимость = 0, и USD-прибыль/ROI были бы завышены.
+    closed_usd = closed[closed["buy_uah_per_usd"].fillna(0) > 0]
+    incomplete = df[sold_mask & ~(has_price & has_date)]
+    bad_qty = df[sold_mask & has_price & has_date & ~valid_qty]
+    open_pos = df[~sold_mask & valid_qty]
 
     realized_profit_uah = float(closed["profit_uah"].fillna(0).sum()) if not closed.empty else 0.0
-    realized_profit_usd = float(closed["profit_usd"].fillna(0).sum()) if not closed.empty else 0.0
+    realized_profit_usd = float(closed_usd["profit_usd"].fillna(0).sum()) if not closed_usd.empty else 0.0
     closed_cost_uah = float(closed["real_cost_uah"].fillna(0).sum()) if not closed.empty else 0.0
     open_cost_uah = float(open_pos["real_cost_uah"].fillna(0).sum()) if not open_pos.empty else 0.0
     overall_roi = (realized_profit_uah / closed_cost_uah * 100.0) if closed_cost_uah > 0 else 0.0
     wins = int((closed["profit_uah"].fillna(0) > 0).sum()) if not closed.empty else 0
     win_rate = (wins / len(closed) * 100.0) if len(closed) > 0 else 0.0
     qty_open = int(open_pos["quantity"].sum()) if not open_pos.empty else 0
+    # Сколько закрытых продаж без курса покупки (их $-прибыль не учтена).
+    no_rate_count = int(len(closed) - len(closed_usd))
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴", delta=f"{overall_roi:+.1f}% ROI")
-    m1.caption(f"≈ {realized_profit_usd:,.2f} $")
+    usd_note = f"≈ {realized_profit_usd:,.2f} $"
+    if no_rate_count > 0:
+        usd_note += f" (без {no_rate_count} партий без курса покупки)"
+    m1.caption(usd_note)
     m2.metric("В остатках на руках", f"{open_cost_uah:,.2f} ₴")
     m2.caption(f"{qty_open} шт в {len(open_pos)} открытых партиях")
     m3.metric("Доля прибыльных", f"{win_rate:.0f}%")
@@ -1291,7 +1520,15 @@ def render_summary(deals):
 
     if not incomplete.empty:
         st.warning(f"Не учтено в итогах: {len(incomplete)} партий отмечены проданными, но без цены "
-                   "продажи. Заполни цену в журнале, чтобы они попали в реализованную прибыль.")
+                   "или даты продажи. Заполни оба поля в журнале, чтобы они попали в реализованную "
+                   "прибыль и в помесячный график.")
+    if not bad_qty.empty:
+        st.warning(f"Исключено из итогов: {len(bad_qty)} партий с некорректным количеством (меньше 1). "
+                   "Поправь количество в журнале.")
+    if no_rate_count > 0:
+        st.warning(f"Долларовая прибыль посчитана без {no_rate_count} проданных партий, у которых не "
+                   "задан курс покупки (для них долларовая себестоимость неизвестна). Гривневый итог "
+                   "по ним учтён. Заполни курс покупки в журнале для точного $-итога.")
 
     if not closed.empty:
         monthly = closed.dropna(subset=["sell_date"]).copy()
@@ -1351,8 +1588,101 @@ def render_export(deals):
         else:
             st.caption(f"Копий пока нет. Бэкап создаётся автоматически раз в сутки при запуске; "
                        f"папка: {BACKUP_DIR.name}/")
-        st.caption("Бэкап при запуске — это снимок на начало дня (до правок в текущей сессии). "
-                   "Чтобы откатиться, закрой приложение и замени deals.db выбранной копией из папки backups.")
+        st.caption("Автоматический бэкап создаётся при ПЕРВОМ запуске приложения в этот день "
+                   "(одна копия в сутки) — это снимок состояния на момент того запуска, до правок "
+                   "в текущей сессии. Чтобы откатиться, закрой приложение и замени deals.db "
+                   "выбранной копией из папки backups.")
+
+
+# ===========================================================================
+# UI: УДАЛЕНИЕ ПАРТИИ (двухшаговое подтверждение + бэкап перед удалением)
+# ===========================================================================
+
+def render_delete(deals):
+    """Удаление выбранной партии по стабильному id с защитой от случайных кликов.
+
+    Удаляется ровно одна партия (строка). Подтверждение двухшаговое: сначала
+    «Удалить выбранную партию», затем явное «Да, удалить» — одиночный случайный
+    клик ничего не стирает. Перед удалением создаётся резервная копия базы
+    (ежедневный снимок при этом не вытесняется — см. prune_backups). Удаление не
+    пересчитывает другие партии; если удаляется часть дробившейся покупки — об
+    этом предупреждаем, остальные части группы остаются.
+    """
+    if not deals:
+        return
+    st.subheader("🗑 Удаление партии")
+    st.caption("Безвозвратно удаляет выбранную партию — например, ошибочную запись. "
+               "Удаление с подтверждением; перед ним создаётся резервная копия базы. "
+               "Другие партии при этом не пересчитываются.")
+
+    # Все партии (и открытые, и проданные), новые сверху — чтобы удобно найти свежую ошибку.
+    ordered = sorted(
+        deals,
+        key=lambda d: (_parse_iso(d.get("buy_date")) or date.min, d.get("id", 0)),
+        reverse=True,
+    )
+    id_by_label, labels = {}, []
+    for d in ordered:
+        lbl = lot_delete_label(d)
+        id_by_label[lbl] = int(d["id"])
+        labels.append(lbl)
+
+    chosen_label = st.selectbox("Партия для удаления", labels, key="delete_select")
+    chosen_id = id_by_label.get(chosen_label)
+
+    # Если выбрали ДРУГУЮ партию — сбрасываем ранее «взведённое» подтверждение,
+    # чтобы случайно не удалить не ту запись.
+    pending = st.session_state.get("pending_delete_id")
+    if pending is not None and pending != chosen_id:
+        st.session_state.pop("pending_delete_id", None)
+        pending = None
+
+    # Шаг 1: кнопка «взводит» подтверждение для выбранной партии (ещё не удаляет).
+    if pending != chosen_id:
+        if st.button("🗑 Удалить выбранную партию", key="delete_arm"):
+            st.session_state["pending_delete_id"] = chosen_id
+            st.rerun()
+        return
+
+    # Шаг 2: подтверждение взведено именно для chosen_id — показываем предупреждение.
+    d = next((x for x in deals if int(x.get("id", -1)) == chosen_id), None)
+    if d is None:  # партия исчезла (например, удалена в другом месте) — сбрасываем.
+        st.session_state.pop("pending_delete_id", None)
+        st.rerun()
+        return
+
+    # Предупреждение о группе (дробившаяся покупка): останутся другие её части.
+    group = str(d.get("lot_group") or "").strip()
+    group_note = ""
+    if group:
+        siblings = [x for x in deals
+                    if str(x.get("lot_group") or "").strip() == group
+                    and int(x.get("id", -1)) != chosen_id]
+        if siblings:
+            group_note = (f"\n\n⚠️ Партия входит в группу с другими ({len(siblings)} шт — "
+                          "покупка дробилась на части/продажи). Удаление только этой части "
+                          "может нарушить сверку по группе (блок «Сверка покупок»); "
+                          "остальные части останутся.")
+
+    st.warning("⚠️ Подтверди удаление — действие необратимо.\n\n"
+               f"**{lot_delete_label(d)}**" + group_note)
+    c_yes, c_no = st.columns(2)
+    with c_yes:
+        if st.button("✅ Да, удалить безвозвратно", type="primary",
+                     key="delete_confirm", use_container_width=True):
+            status, path = make_backup(force=True, manual=True)
+            apply_changes([], [], [chosen_id])
+            st.session_state.pop("pending_delete_id", None)
+            if status == "created":
+                st.toast(f"Партия #{chosen_id} удалена. Бэкап: {path.name}", icon="🗑️")
+            else:
+                st.toast(f"Партия #{chosen_id} удалена (резервную копию создать не удалось)",
+                         icon="⚠️")
+            st.rerun()
+    with c_no:
+        if st.button("Отмена", key="delete_cancel", use_container_width=True):
+            st.session_state.pop("pending_delete_id", None)
+            st.rerun()
 
 
 # ===========================================================================
@@ -1362,8 +1692,8 @@ def render_export(deals):
 def main():
     st.set_page_config(page_title="Yev Steam Trading Ledger", page_icon="📒", layout="wide")
     init_db()
-    # Снимок «как было на начало дня» — до любых правок в этой сессии.
-    # Не чаще одной копии в сутки; ошибки бэкапа не мешают работе приложения.
+    # Снимок состояния на момент первого запуска за день — до любых правок в
+    # этой сессии. Не чаще одной копии в сутки; ошибки бэкапа не мешают работе.
     make_backup()
 
     st.title("📒 Yev Steam Trading Ledger")
@@ -1378,6 +1708,8 @@ def main():
     render_sell_from_holdings(deals)
     st.divider()
     render_ledger(deals)
+    st.divider()
+    render_delete(deals)
     st.divider()
     render_summary(deals)
     st.divider()
