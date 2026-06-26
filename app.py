@@ -62,13 +62,14 @@ DB_PATH = Path(__file__).resolve().parent / "deals.db"
 
 # Папка для резервных копий и параметры ротации.
 BACKUP_DIR = DB_PATH.parent / "backups"
-BACKUP_KEEP = 10                 # сколько последних ежедневных копий хранить
+BACKUP_KEEP_DAILY = 8            # сколько последних ежедневных (авто) копий хранить
+BACKUP_KEEP_MANUAL = 4           # сколько последних ручных копий хранить
 BACKUP_PREFIX = "deals.db."      # имя копии: deals.db.YYYY-MM-DD.bak
 BACKUP_SUFFIX = ".bak"
 
-DEFAULT_DEPOSIT_PROFIT = 48.0   # чистый плюс пополнения Steam, %
+DEFAULT_DEPOSIT_PROFIT = 47.0   # чистый плюс пополнения Steam, %
 DEFAULT_SALES_FEE = 2.0         # комиссия сайта за продажу, %
-DEFAULT_RATE = 45.05            # сколько ₴ в 1 $
+DEFAULT_RATE = 45.25            # сколько ₴ в 1 $
 
 # Поля ввода, видимые в журнале (два отдельных курса вместо одного).
 INPUT_COLUMNS = [
@@ -352,35 +353,44 @@ def _manual_backup_path(moment):
     return BACKUP_DIR / f"{BACKUP_PREFIX}{ts}{BACKUP_SUFFIX}"
 
 
-def _backup_sort_key(path):
-    """Ключ хронологической сортировки бэкапа по РАЗОБРАННОМУ имени.
+def _parse_backup_name(path):
+    """Разбирает имя файла бэкапа в (core, числовой_суффикс_коллизии).
 
-    Имя имеет вид deals.db.YYYY-MM-DD[.bak] (ежедневный) или
+    Имя: deals.db.YYYY-MM-DD[.bak] (ежедневный) или
     deals.db.YYYY-MM-DD_HH-MM-SS[_N][.bak] (ручной, N — суффикс коллизии).
-    Возвращает кортеж (метка_времени, числовой_суффикс), чтобы порядок совпадал
-    с реальной хронологией независимо от ширины суффикса (_2 vs _10 vs _100):
-    числовой суффикс сравнивается как ЧИСЛО, а не как строка. Ежедневный снимок
-    (без времени) считается «началом дня» (00:00:00) с суффиксом 0.
+        core    — 'YYYY-MM-DD' (ежедневный) либо 'YYYY-MM-DD_HH-MM-SS' (ручной);
+        суффикс — ДОПОЛНИТЕЛЬНЫЙ _<число> ПОСЛЕ времени (или 0).
+    Единый разбор имени, чтобы сортировка и классификация типа не разошлись.
     """
     stem = path.name[len(BACKUP_PREFIX):]
     if stem.endswith(BACKUP_SUFFIX):
         stem = stem[:-len(BACKUP_SUFFIX)]
-    # Отделяем числовой суффикс коллизии, если он есть (последний _<число>).
-    suffix_num = 0
-    core = stem
+    core, suffix_num = stem, 0
     if "_" in stem:
         head, _, tail = stem.rpartition("_")
-        if tail.isdigit() and head:  # это суффикс коллизии, а не часть времени
-            # Но время тоже содержит '_' (дата_время). Суффикс коллизии — это
-            # ДОПОЛНИТЕЛЬНЫЙ _<число> ПОСЛЕ HH-MM-SS. Распознаём по длине головы.
-            # core должен быть либо 'YYYY-MM-DD', либо 'YYYY-MM-DD_HH-MM-SS'.
-            if head.count("_") in (0, 1):
-                core, suffix_num = head, int(tail)
-    # core -> сопоставимая метка: ежедневный (только дата) дополняем временем.
-    if "_" in core:
-        ts = core  # 'YYYY-MM-DD_HH-MM-SS'
-    else:
-        ts = core + "_00-00-00"  # ежедневный снимок = начало дня
+        # Суффикс коллизии — это _<число> уже ПОСЛЕ core; core это 'YYYY-MM-DD'
+        # либо 'YYYY-MM-DD_HH-MM-SS' (0 или 1 символ '_').
+        if tail.isdigit() and head and head.count("_") in (0, 1):
+            core, suffix_num = head, int(tail)
+    return core, suffix_num
+
+
+def _backup_is_manual(path):
+    """True для РУЧНОГО бэкапа (в имени есть время), False для ежедневного (только дата)."""
+    core, _ = _parse_backup_name(path)
+    return "_" in core
+
+
+def _backup_sort_key(path):
+    """Ключ хронологической сортировки бэкапа по РАЗОБРАННОМУ имени.
+
+    Возвращает (метка_времени, числовой_суффикс): порядок совпадает с реальной
+    хронологией независимо от ширины суффикса (_2 vs _10 vs _100) — суффикс
+    сравнивается как ЧИСЛО. Ежедневный снимок (без времени) считается «началом
+    дня» (00:00:00) с суффиксом 0.
+    """
+    core, suffix_num = _parse_backup_name(path)
+    ts = core if "_" in core else core + "_00-00-00"
     return (ts, suffix_num)
 
 
@@ -397,20 +407,26 @@ def list_backups():
     return sorted(files, key=_backup_sort_key, reverse=True)
 
 
-def prune_backups(keep=BACKUP_KEEP):
-    """Оставляет последние keep копий, но ВСЕГДА сохраняет сегодняшний ежедневный
-    снимок (его нельзя вытеснить ручными копиями).
+def prune_backups(keep_daily=BACKUP_KEEP_DAILY, keep_manual=BACKUP_KEEP_MANUAL):
+    """Прореживает копии РАЗДЕЛЬНО по типам.
+
+    Оставляет последние keep_daily ЕЖЕДНЕВНЫХ (авто) снимков и последние
+    keep_manual РУЧНЫХ копий, считая каждый тип в своей квоте. Поэтому всплеск
+    ручных копий (например, серия удалений за день) больше НЕ вытесняет
+    ежедневную историю, и наоборот. Сегодняшний ежедневный снимок защищён всегда.
 
     Возвращает число удалённых файлов. Ошибки удаления отдельных файлов
     игнорируются (бэкап не должен мешать работе приложения).
     """
-    protected = _daily_backup_path(date.today())  # ежедневный снимок за сегодня
-    all_backups = list_backups()                  # новейшие первыми
-    # Кандидаты на хранение: keep новейших. Если сегодняшний daily не попал в них
-    # (например, сделано много ручных копий за сегодня), всё равно его защищаем.
-    keep_set = set(all_backups[:keep])
-    if protected.exists():
-        keep_set.add(protected)
+    all_backups = list_backups()                       # новейшие первыми
+    daily = [p for p in all_backups if not _backup_is_manual(p)]
+    manual = [p for p in all_backups if _backup_is_manual(p)]
+    # Последние keep_daily ежедневных + последние keep_manual ручных (каждый тип — своя квота).
+    keep_set = set(daily[:keep_daily]) | set(manual[:keep_manual])
+    # Сегодняшний ежедневный снимок защищаем всегда (даже если квота ежедневных = 0).
+    today_daily = _daily_backup_path(date.today())
+    if today_daily.exists():
+        keep_set.add(today_daily)
 
     removed = 0
     for p in all_backups:
@@ -460,7 +476,8 @@ def make_backup(force=False, manual=False):
           Никогда не перезаписывает утренний ежедневный снимок и не теряет его,
           даже если базу только что испортили и нажали кнопку.
 
-    После успешной копии прореживает старые до BACKUP_KEEP.
+    После успешной копии прореживает старые: отдельно до BACKUP_KEEP_DAILY ежедневных
+    и BACKUP_KEEP_MANUAL ручных копий.
 
     Возвращает (status, path):
         status: 'created' | 'exists' | 'error'; path: Path или None.
@@ -860,6 +877,10 @@ def validate_deals(deals):
             warnings.append(f"«{name}»: дата покупки ({bd.isoformat()}) в будущем — проверь дату.")
         if sd and sd > today:
             warnings.append(f"«{name}»: дата продажи ({sd.isoformat()}) в будущем — проверь дату.")
+        # Нет даты покупки у ПРОДАННОЙ партии: себестоимость считается, но срок
+        # удержания (holding_days) посчитать нельзя — для завершённой сделки это важно.
+        if sold and _to_iso(d.get("buy_date")) == "":
+            warnings.append(f"«{name}»: продано, но не указана дата покупки — срок удержания не посчитать.")
 
         buy_rate = _to_float(d.get("buy_uah_per_usd"))
         sell_rate = _to_float(d.get("sell_uah_per_usd"))
@@ -997,6 +1018,11 @@ def build_dataframe(deals):
         # него долларовая себестоимость = 0, и profit_usd был бы завышен (вся
         # выручка). Гривневую прибыль показываем всегда (она от курса не зависит).
         usd_defined = complete_sale and _to_float(d.get("buy_uah_per_usd")) > 0
+        # Некорректное количество (<1) исключаем из ВСЕХ расчётных колонок: иначе журнал
+        # показал бы себестоимость/прибыль, посчитанную по форсированному количеству 1
+        # (compute_deal), тогда как сводка такую строку исключает. Так journal и сводка
+        # согласованы — для битого количества расчёт пуст (—).
+        qty_ok = _to_int(d.get("quantity"), 0) >= 1
         records.append({
             "_id": d.get("id"),
             "_lot_group": d.get("lot_group", ""),
@@ -1011,10 +1037,10 @@ def build_dataframe(deals):
             "site_sell_price": sell_price_val,
             "sales_fee_pct": _to_float(d.get("sales_fee_pct")),
             "sell_uah_per_usd": _to_float(d.get("sell_uah_per_usd")),
-            "real_cost_uah": round(calc["real_cost_uah"], 2),
-            "profit_uah": round(calc["profit_uah"], 2) if complete_sale else None,
-            "profit_usd": round(calc["profit_usd"], 2) if usd_defined else None,
-            "roi_pct": round(roi, 1) if (complete_sale and roi is not None) else None,
+            "real_cost_uah": round(calc["real_cost_uah"], 2) if qty_ok else None,
+            "profit_uah": round(calc["profit_uah"], 2) if (complete_sale and qty_ok) else None,
+            "profit_usd": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
+            "roi_pct": round(roi, 1) if (complete_sale and roi is not None and qty_ok) else None,
             "holding_days": holding_days(d.get("buy_date"), d.get("sell_date")),
             "status": status,
         })
@@ -1164,22 +1190,26 @@ def render_purchase():
             "steam_buy_price": float(steam_price), "deposit_profit_pct": float(deposit_profit),
             "buy_uah_per_usd": float(buy_rate),
         }
-        if sold_now and will_sell > 0:
-            # Закрытая часть и остаток одной покупки записываются АТОМАРНО и с
-            # общей группой (insert_deals_atomic назначит её по id первой части).
-            lots = [{**purchase, "quantity": will_sell, "sold": 1,
-                     "sell_date": _to_iso(sell_d), "site_sell_price": float(site_price),
-                     "sales_fee_pct": float(sales_fee), "sell_uah_per_usd": float(sell_rate)}]
-            remaining = int(qty_bought) - will_sell
-            if remaining > 0:
-                lots.append({**purchase, "quantity": remaining, "sold": 0, "sell_date": "",
+        try:
+            if sold_now and will_sell > 0:
+                # Закрытая часть и остаток одной покупки записываются АТОМАРНО и с
+                # общей группой (insert_deals_atomic назначит её по id первой части).
+                lots = [{**purchase, "quantity": will_sell, "sold": 1,
+                         "sell_date": _to_iso(sell_d), "site_sell_price": float(site_price),
+                         "sales_fee_pct": float(sales_fee), "sell_uah_per_usd": float(sell_rate)}]
+                remaining = int(qty_bought) - will_sell
+                if remaining > 0:
+                    lots.append({**purchase, "quantity": remaining, "sold": 0, "sell_date": "",
+                                 "site_sell_price": 0.0, "sales_fee_pct": 0.0, "sell_uah_per_usd": 0.0})
+                insert_deals_atomic(lots)
+            else:
+                insert_deal({**purchase, "quantity": int(qty_bought), "sold": 0, "sell_date": "",
                              "site_sell_price": 0.0, "sales_fee_pct": 0.0, "sell_uah_per_usd": 0.0})
-            insert_deals_atomic(lots)
+        except Exception as e:
+            st.error(f"Не удалось сохранить покупку в базу: {e}. Данные не записаны — попробуй ещё раз.")
         else:
-            insert_deal({**purchase, "quantity": int(qty_bought), "sold": 0, "sell_date": "",
-                         "site_sell_price": 0.0, "sales_fee_pct": 0.0, "sell_uah_per_usd": 0.0})
-        st.success("Покупка добавлена.")
-        st.rerun()
+            st.success("Покупка добавлена.")
+            st.rerun()
 
 
 # ===========================================================================
@@ -1242,12 +1272,16 @@ def render_sell_from_holdings(deals):
         st.caption("Продаётся весь остаток — позиция закроется полностью.")
 
     if st.button("💾 Записать продажу", type="primary", use_container_width=True):
-        updates, inserts, dels = replace_lot_with_sale(
-            deals, selected_id, int(sell_qty), _to_iso(sell_d),
-            float(site_price), float(sales_fee), float(sell_rate))
-        apply_changes(updates, inserts, dels)
-        st.success("Продажа записана.")
-        st.rerun()
+        try:
+            updates, inserts, dels = replace_lot_with_sale(
+                deals, selected_id, int(sell_qty), _to_iso(sell_d),
+                float(site_price), float(sales_fee), float(sell_rate))
+            apply_changes(updates, inserts, dels)
+        except Exception as e:
+            st.error(f"Не удалось записать продажу: {e}. Данные не изменены — попробуй ещё раз.")
+        else:
+            st.success("Продажа записана.")
+            st.rerun()
 
 
 # ===========================================================================
@@ -1357,9 +1391,22 @@ def render_ledger(deals):
                    "Правки ручные и не пересчитывают другие партии — сверяйся с блоком ниже.")
 
     df = build_dataframe(view_deals)
-    # Ключ редактора зависит от вида (число строк + поиск + сортировка): при смене
-    # вида Streamlit пересоздаёт виджет, а не тянет устаревшие позиции строк.
-    view_sig = f"{len(df)}_{query.lower()}_{sort_mode}"
+    # Ключ редактора зависит от вида (число строк + поиск + сортировка) И от содержимого
+    # видимых партий: при смене вида ИЛИ после сохранения (данные изменились, но число
+    # строк осталось прежним) Streamlit пересоздаёт виджет, а не подмешивает устаревшие
+    # правки. Подпись считается по СОХРАНЁННЫМ данным (view_deals), поэтому во время
+    # редактирования (до сохранения) ключ стабилен и правки не сбрасываются.
+    import hashlib
+    data_sig = hashlib.md5(repr([
+        (d.get("id"), d.get("item_name"), _to_iso(d.get("buy_date")),
+         _to_float(d.get("steam_buy_price")), _to_int(d.get("quantity"), 0),
+         _to_float(d.get("deposit_profit_pct")), _to_float(d.get("buy_uah_per_usd")),
+         _to_bool(d.get("sold")), _to_iso(d.get("sell_date")),
+         _to_float(d.get("site_sell_price")), _to_float(d.get("sales_fee_pct")),
+         _to_float(d.get("sell_uah_per_usd")))
+        for d in view_deals
+    ]).encode("utf-8")).hexdigest()[:10]
+    view_sig = f"{len(df)}_{query.lower()}_{sort_mode}_{data_sig}"
     editor_key = f"ledger_editor_{view_sig}"
     column_order = INPUT_COLUMNS + COMPUTED_COLUMNS  # _id и _lot_group скрыты
     edited_df = st.data_editor(
@@ -1413,10 +1460,14 @@ def render_ledger(deals):
                 if st.session_state.get("_last_save_sig") == sig:
                     st.info("Эти изменения уже сохранены.")
                 else:
-                    apply_changes(updates, inserts, dels)
-                    st.session_state["_last_save_sig"] = sig
-                    st.success(f"Сохранено: изменено {len(updates)}, добавлено {len(inserts)}, удалено {len(dels)}.")
-                    st.rerun()
+                    try:
+                        apply_changes(updates, inserts, dels)
+                    except Exception as e:
+                        st.error(f"Не удалось сохранить изменения: {e}. Данные не записаны — попробуй ещё раз.")
+                    else:
+                        st.session_state["_last_save_sig"] = sig
+                        st.success(f"Сохранено: изменено {len(updates)}, добавлено {len(inserts)}, удалено {len(dels)}.")
+                        st.rerun()
     with col_info:
         st.caption("Изменения в таблице не сохранятся, пока не нажата кнопка.")
 
@@ -1500,7 +1551,7 @@ def render_summary(deals):
     realized_profit_usd = float(closed_usd["profit_usd"].fillna(0).sum()) if not closed_usd.empty else 0.0
     closed_cost_uah = float(closed["real_cost_uah"].fillna(0).sum()) if not closed.empty else 0.0
     open_cost_uah = float(open_pos["real_cost_uah"].fillna(0).sum()) if not open_pos.empty else 0.0
-    overall_roi = (realized_profit_uah / closed_cost_uah * 100.0) if closed_cost_uah > 0 else 0.0
+    overall_roi = (realized_profit_uah / closed_cost_uah * 100.0) if closed_cost_uah > 0 else None
     wins = int((closed["profit_uah"].fillna(0) > 0).sum()) if not closed.empty else 0
     win_rate = (wins / len(closed) * 100.0) if len(closed) > 0 else 0.0
     qty_open = int(open_pos["quantity"].sum()) if not open_pos.empty else 0
@@ -1508,7 +1559,15 @@ def render_summary(deals):
     no_rate_count = int(len(closed) - len(closed_usd))
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴", delta=f"{overall_roi:+.1f}% ROI")
+    # ROI не определён при нулевой себестоимости (например, бесплатные дропы): показываем
+    # «н/д», а не обманчивые 0%. Если закрытых продаж нет вовсе — дельту не показываем.
+    if overall_roi is not None:
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴", delta=f"{overall_roi:+.1f}% ROI")
+    elif not closed.empty:
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴",
+                  delta="ROI н/д (себестоимость 0)", delta_color="off")
+    else:
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴")
     usd_note = f"≈ {realized_profit_usd:,.2f} $"
     if no_rate_count > 0:
         usd_note += f" (без {no_rate_count} партий без курса покупки)"
@@ -1583,8 +1642,8 @@ def render_export(deals):
     with col_info:
         if backups:
             newest = backups[0].name
-            st.caption(f"Копий: {len(backups)} (хранится до {BACKUP_KEEP}). "
-                       f"Свежая: {newest}. Папка: {BACKUP_DIR.name}/")
+            st.caption(f"Копий: {len(backups)} (хранится до {BACKUP_KEEP_DAILY} ежедневных "
+                       f"и {BACKUP_KEEP_MANUAL} ручных). Свежая: {newest}. Папка: {BACKUP_DIR.name}/")
         else:
             st.caption(f"Копий пока нет. Бэкап создаётся автоматически раз в сутки при запуске; "
                        f"папка: {BACKUP_DIR.name}/")
@@ -1670,15 +1729,19 @@ def render_delete(deals):
     with c_yes:
         if st.button("✅ Да, удалить безвозвратно", type="primary",
                      key="delete_confirm", use_container_width=True):
-            status, path = make_backup(force=True, manual=True)
-            apply_changes([], [], [chosen_id])
-            st.session_state.pop("pending_delete_id", None)
-            if status == "created":
-                st.toast(f"Партия #{chosen_id} удалена. Бэкап: {path.name}", icon="🗑️")
+            try:
+                status, path = make_backup(force=True, manual=True)
+                apply_changes([], [], [chosen_id])
+            except Exception as e:
+                st.error(f"Не удалось удалить партию: {e}. Данные не изменены — попробуй ещё раз.")
             else:
-                st.toast(f"Партия #{chosen_id} удалена (резервную копию создать не удалось)",
-                         icon="⚠️")
-            st.rerun()
+                st.session_state.pop("pending_delete_id", None)
+                if status == "created":
+                    st.toast(f"Партия #{chosen_id} удалена. Бэкап: {path.name}", icon="🗑️")
+                else:
+                    st.toast(f"Партия #{chosen_id} удалена (резервную копию создать не удалось)",
+                             icon="⚠️")
+                st.rerun()
     with c_no:
         if st.button("Отмена", key="delete_cancel", use_container_width=True):
             st.session_state.pop("pending_delete_id", None)
