@@ -1,4058 +1,1751 @@
+# -*- coding: utf-8 -*-
 """
-╔════════════════════════════════════════════════════════════════════════════╗
-║                                                                            ║
-║                        YEV STEAM DEPOSIT CALCULATOR                        ║
-║                                                                            ║
-║ Copyright (c) 2026 Bohdan Yevtushenko (Mr4Cemper)                          ║
-║ License: AGPL 3.0 — see the LICENSE file for the full text.                ║
-║                                                                            ║
-║ ────────────────────────────────────────────────────────────────────────── ║
-║                                                                            ║
-║ DISCLAIMER: This application is an independent educational and analytical  ║
-║ tool. It is NOT affiliated with, endorsed, sponsored, or specifically      ║
-║ approved by Valve Corporation. Counter-Strike, CS2, Steam, and their       ║
-║ respective logos are trademarks and/or registered trademarks of Valve      ║
-║ Corporation.                                                               ║
-║                                                                            ║
-╚════════════════════════════════════════════════════════════════════════════╝
+Yev Steam Trading Ledger — журнал сделок со скинами CS2
+=======================================================
 
-Yev Steam Deposit Calculator
-============================
+Локальное приложение на Streamlit для личного учёта сделок: покупка предмета за
+баланс Steam (пополненный «в плюс») и продажа на стороннем сайте с выводом в
+реальные деньги. Приложение хранит каждую сделку, считает реальную прибыль и
+показывает сводку.
 
-Версия: единственный источник истины — константа APP_VERSION ниже
-(в докстринге номер намеренно не дублируется, чтобы он не устаревал).
+Модель «партий» (lots):
+    Одна покупка N одинаковых предметов может продаваться по частям — в разные
+    дни и по разным ценам, а часть может остаться непроданной. Единица учёта —
+    «партия»: количество предметов из одной покупки с общей ценой закупки.
+    Покупка создаёт открытую партию (остаток на руках). Продажа списывает часть
+    остатка и создаёт закрытую партию со своей ценой и датой.
 
-Streamlit-приложение для оценки экономики торговли скинами CS2. Оно сравнивает
-стоимость покупки/продажи предмета на стороннем сайте за реальные деньги с
-операциями по тому же предмету на Торговой площадке Steam.
+Хранение данных:
+    Партии хранятся в локальном файле SQLite (deals.db) рядом со скриптом.
+    Данные переживают перезапуск приложения и компьютера. Идентификаторы партий
+    (id) СТАБИЛЬНЫ: правки из таблицы применяются точечными UPDATE/INSERT/DELETE
+    по id, а не полной перезаписью, поэтому номера в списках не «убегают».
+    Запись в базу выполняется атомарно (в одной транзакции).
 
-Режимы работы:
-    Режим 1 — прибыль от покупки скина на стороннем сайте и его последующей
-        продажи на Торговой площадке Steam.
-    Режим 2 — где купить выгоднее: напрямую на сайте за реальные деньги или
-        на Steam за заранее пополненный баланс.
-    Режим 3 — вывод средств (cashout): покупка на Steam за баланс, продажа на
-        сайте и вывод выручки на карту/крипту.
-    Режим 4 — где продать выгоднее: на стороннем сайте (с пополнением Steam в
-        плюс) или напрямую на Торговой площадке Steam.
-    Режим 5 — оценка коллекции: ранг каждой редкости по соотношению цен соседних
-        редкостей. Простой режим — одна цена на редкость (+ бонус «красивое/
-        ликвидное»). Продвинутый режим — резка флоата, наценка за чистоту внутри
-        скина и экономика контрактов 10→1 на реальных записях (два режима подбора
-        филлеров: по самым дешёвым либо по лучшему соотношению цена/качество),
-        опциональный учёт цен Steam (ТП) и готовые шаблоны коллекций.
+Две валюты и фиксация курса (важно для корректной долларовой прибыли):
+    * баланс Steam — в гривнах (₴); продажа на сайте — в долларах ($);
+    * у партии ДВА независимых курса:
+        buy_uah_per_usd  — курс на момент ПОКУПКИ (фиксирует долларовую
+                           себестоимость баланса);
+        sell_uah_per_usd — курс на момент ПРОДАЖИ (переводит выручку в ₴).
+    Долларовая себестоимость считается по курсу покупки, а не по курсу продажи,
+    поэтому девальвация гривны не создаёт «фантомную» долларовую прибыль.
 
-Структура модуля:
-    * Расчётные функции (calculate_*, get_valid_steam_price, движок контрактов)
-      не зависят от Streamlit и не имеют побочных эффектов; их можно тестировать
-      и переиспользовать отдельно от интерфейса.
-    * Локализация (en / ru / ua) реализована через словарь переводов и функцию
-      доступа _(); английский текст служит ключом перевода. Код языка украинского
-      именно 'ua' (а не ISO 'uk') — так его не путают с United Kingdom.
-    * Функции calculate_mode_1..calculate_mode_5 строят интерфейс соответствующих
-      режимов, main() настраивает страницу и является точкой входа.
-    * Новостная лента (NEWS + render_news) — статичные сообщения с датами прямо в
-      коде: их видит каждый, кто запустил эту версию. Запросов в сеть нет.
+Расчёт по одной партии:
+    Реальная стоимость (₴) = (цена покупки в Steam × кол-во) ÷ (1 + плюс% / 100)
+    Себестоимость ($)      = реальная стоимость (₴) ÷ курс ПОКУПКИ
+    Выручка ($)            = (цена продажи × кол-во) × (1 − комиссия% / 100)
+    Выручка (₴)            = выручка ($) × курс ПРОДАЖИ
+    Прибыль (₴)            = выручка (₴) − реальная стоимость (₴)
+    Прибыль ($)            = выручка ($) − себестоимость ($)
+    ROI %                  = прибыль (₴) ÷ реальная стоимость (₴) × 100
 
 Запуск:
-    streamlit run app.py
-(В репозитории рабочий файл называется app.py — так его запускает Streamlit Cloud
-и так принято во всех проектах; локальные рабочие копии нумеруются как
-SteamCalcu<версия>.py и переименовываются в app.py при коммите.)
+    streamlit run ledger.py
 """
 
-import html
-from datetime import date
+import io
+import os
+from collections import defaultdict
+from datetime import date, datetime
+from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
-# Версия приложения — ЕДИНСТВЕННЫЙ источник истины (показывается в интерфейсе).
-APP_VERSION = "2.16"
 
 # ===========================================================================
-# КОНФИГУРАЦИЯ И КОНСТАНТЫ
+# КОНСТАНТЫ
 # ===========================================================================
 
-# Предустановленные профили комиссий популярных торговых площадок.
-# Ключи словаря используются как стабильные идентификаторы и не переводятся;
-# исключение — "Manual input", который локализуется через format_func.
-# Поля профиля:
-#   percent_fee   — процент комиссии пополнения;
-#   fixed_fee_usd — фиксированная комиссия; задаётся всегда в долларах США и
-#                   при необходимости конвертируется в валюту расчёта;
-#   enabled       — учитывать ли комиссию по умолчанию при выборе профиля.
-DEPOSIT_FEE_TEMPLATES = {
-    "Manual input":      {"percent_fee": 0.00, "fixed_fee_usd": 0.00, "enabled": False},
-    "CSFloat (Crypto)":  {"percent_fee": 1.00, "fixed_fee_usd": 0.00, "enabled": True},
-    "CSFloat (Card)":    {"percent_fee": 2.80, "fixed_fee_usd": 0.30, "enabled": True},
-    "SkinSwap (Card)":   {"percent_fee": 3.52, "fixed_fee_usd": 0.32, "enabled": True},
-    "SkinSwap (Crypto)": {"percent_fee": 1.01, "fixed_fee_usd": 0.01, "enabled": True},
-}
+DB_PATH = Path(__file__).resolve().parent / "deals.db"
 
-# Комиссия Steam при продаже по умолчанию: 10% CS2 + 5% Steam = 15%.
-DEFAULT_STEAM_FEE_PERCENT = 15.0
+# Папка для резервных копий и параметры ротации.
+BACKUP_DIR = DB_PATH.parent / "backups"
+BACKUP_KEEP_DAILY = 8            # сколько последних ежедневных (авто) копий хранить
+BACKUP_KEEP_MANUAL = 4           # сколько последних ручных копий хранить
+BACKUP_PREFIX = "deals.db."      # имя копии: deals.db.YYYY-MM-DD.bak
+BACKUP_SUFFIX = ".bak"
 
-# Для целочисленных валют комиссия Steam рассчитывается фиксированным
-# разбиением 10% (CS2) + 5% (Steam); общее поле "комиссия %" в интерфейсе
-# на такие валюты не влияет.
-STEAM_CS2_FEE_PERCENT = 10.0
-STEAM_STEAM_FEE_PERCENT = 5.0
+DEFAULT_DEPOSIT_PROFIT = 47.0   # чистый плюс пополнения Steam, %
+DEFAULT_SALES_FEE = 2.0         # комиссия сайта за продажу, %
+DEFAULT_RATE = 45.25            # сколько ₴ в 1 $
 
-# Валюты для отображения результатов (символы).
-CURRENCIES = ["$", "€", "₴", "₽", "£"]
-DEFAULT_CURRENCY = "$"
+# Поля ввода, видимые в журнале (два отдельных курса вместо одного).
+INPUT_COLUMNS = [
+    "item_name", "buy_date", "steam_buy_price", "quantity", "deposit_profit_pct",
+    "buy_uah_per_usd", "sold", "sell_date", "site_sell_price", "sales_fee_pct",
+    "sell_uah_per_usd",
+]
+COMPUTED_COLUMNS = [
+    "real_cost_uah", "profit_uah", "profit_usd", "roi_pct", "holding_days", "status",
+]
 
-# Грубые стартовые курсы "сколько валюты за 1 USD" (РЕДАКТИРУЕМЫЕ значения по
-# умолчанию для поля конвертации фиксы; курсы меняются — это лишь подсказка).
-USD_RATE_DEFAULTS = {"€": 0.92, "₴": 41.0, "₽": 90.0, "£": 0.79}
+# Поля, описывающие покупку (общие для всех партий из одной покупки).
+PURCHASE_FIELDS = ["item_name", "buy_date", "steam_buy_price", "deposit_profit_pct",
+                   "buy_uah_per_usd", "lot_group"]
 
-# Валюты, у которых на Торговой площадке Steam НЕТ дробной части: цены и
-# комиссии выражаются только в целых единицах. Указаны и символы, и буквенные
-# коды (гривна, иена, вона, чилийское песо, индонезийская рупия).
-INTEGER_CURRENCIES = ["₴", "¥", "₩", "CLP", "IDR"]
-
-# Текстовые псевдонимы тех же валют для распознавания по коду в свободном вводе
-# (продвинутый режим). Множество нормализовано к нижнему регистру.
-_INTEGER_CURRENCY_ALIASES = {
-    "₴", "uah", "грн", "uah.", "¥", "jpy", "yen", "иена",
-    "₩", "krw", "won", "вона", "clp", "idr", "rp",
-}
-
-# Коды/символы, означающие доллар США.
-USD_CODES = {"usd", "$", "usd.", "us$"}
-
-# Языки: отображаемое имя -> код.
-LANG_OPTIONS = {"English": "en", "Русский": "ru", "Українська": "ua"}
-DEFAULT_LANG_NAME = "English"   # язык интерфейса по умолчанию
+# Полный список колонок данных в таблице БД (без id).
+DB_FIELDS = [
+    "item_name", "buy_date", "steam_buy_price", "quantity", "deposit_profit_pct",
+    "buy_uah_per_usd", "sold", "sell_date", "site_sell_price", "sales_fee_pct",
+    "sell_uah_per_usd", "lot_group",
+]
 
 
 # ===========================================================================
-# ЛОКАЛИЗАЦИЯ (i18n)
+# БЕЗОПАСНОЕ ПРИВЕДЕНИЕ ТИПОВ (защита от NaN/None/пустых значений)
 # ===========================================================================
-# Английские строки используются как ключи (паттерн gettext). Для en функция
-# возвращает сам ключ; исключение — спец-ключи (например, MODE1_FORMULAS),
-# для которых английский текст хранится в TRANSLATIONS["en"].
 
-_CURRENT_LANG = "en"
+def _num(value, default):
+    """NaN / None / пустая строка -> default; иначе исходное значение.
 
-
-def set_language(code):
-    """Задаёт активный язык интерфейса ('en' | 'ru' | 'ua')."""
-    global _CURRENT_LANG
-    _CURRENT_LANG = code if code in ("en", "ru", "ua") else "en"
-
-
-def _(key):
-    """Возвращает перевод строки key для активного языка.
-
-    Сначала ищем ключ в словаре активного языка (для en там лежат только
-    спец-ключи вроде формул). Если не нашли — возвращаем сам ключ, который
-    для английского и является готовой строкой (безопасный fallback).
+    st.data_editor для новых/пустых строк отдаёт NaN, а NaN «истинный»
+    (bool(nan) == True), поэтому конструкции `value or default` его не отсекают,
+    а int(nan) и вовсе падает. Эта функция централизует защиту.
     """
-    return TRANSLATIONS.get(_CURRENT_LANG, {}).get(key, key)
+    try:
+        if value is None or pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        return default
+    if isinstance(value, str) and value.strip() == "":
+        return default
+    return value
 
 
-# Словарь переводов. Плейсхолдеры в фигурных скобках ({a}, {amount}, ...)
-# СОХРАНЯЮТСЯ во всех языках — подстановка значений делается через .format().
-TRANSLATIONS = {
-    # Для английского храним только строки, чьё значение отличается от ключа.
-    "en": {
-        "MODE1_FORMULAS":
-            "- **Real spent** = (site price × qty) × (1 + fee% / 100) + fixed USD fee (converted)\n"
-            "- **Steam received** = seller subtotal × qty. The subtotal is derived from the buyer "
-            "price using Steam's exact fee model: each fee is floored (truncated) with a 1-unit "
-            "minimum, computed in the currency's smallest unit — whole units for integer currencies, "
-            "cents otherwise.\n"
-            "- **Net profit** = Steam received − Real spent\n"
-            "- **Profit %** = Net profit / Real spent × 100\n\n"
-            "In advanced mode each side is first computed in its own currency, then converted to the "
-            "spent (base) currency via your rates.",
-        "MODE2_FORMULAS":
-            "- **Real price (site)** = (site price × qty) × (1 + fee% / 100) + fixed USD fee (converted)\n"
-            "- **Real price (Steam)** = (Steam price × qty) / (1 + top-up profit% / 100)\n"
-            "- **Savings** = |site real price − Steam real price| (in the base currency when advanced).",
-        "MODE3_FORMULAS":
-            "- **Steam balance spent** = Steam purchase price × qty\n"
-            "- **Real Steam cost** = Steam balance spent / (1 + top-up profit% / 100)  *(only when top-up profit is set)*\n"
-            "- **Gross site revenue** = site sell price × qty\n"
-            "- **After sales fee** = gross revenue × (1 − sales fee% / 100)\n"
-            "- **Real money received** = after sales fee × (1 − withdrawal fee% / 100) − fixed USD fee (converted)\n"
-            "- **Cashout ratio** = real money received / Real Steam cost × 100  *(or / Steam balance spent when no top-up profit)*\n"
-            "- **Net profit / loss** = real money received − Real Steam cost\n\n"
-            "In advanced mode the site side and the Steam side are each computed in their own currency, "
-            "then converted to the base (card) currency via your rates.",
-        "Real Steam cost (with top-up)": "Real Steam cost (with top-up)",
-        "Effective cashout ratio": "Effective cashout ratio",
-        "Top-up profit factored in. Ratio > 100% means you profit even after cashing out.":
-            "Top-up profit factored in. Ratio > 100% means you profit even after cashing out.",
-        # --- Режим 4 ---
-        "Where to sell more profitably?": "Where to sell more profitably?",
-        "We compare selling a skin on a third-party site (then topping up Steam at a profit) "
-        "versus selling it directly on the Steam Market.":
-            "We compare selling a skin on a third-party site (then topping up Steam at a profit) "
-            "versus selling it directly on the Steam Market.",
-        "Sell on third-party site → top up Steam": "Sell on third-party site → top up Steam",
-        "Sell on Steam Market directly": "Sell on Steam Market directly",
-        "Steam sell price (buyer pays)": "Steam sell price (buyer pays)",
-        "Steam Market fee (%)": "Steam Market fee (%)",
-        "Steam balance via site (with top-up)": "Steam balance via site (with top-up)",
-        "Steam balance via Steam Market": "Steam balance via Steam Market",
-        "Real money from site: {amount}": "Real money from site: {amount}",
-        "Selling via site and topping up Steam is more profitable. "
-        "Extra Steam balance: {amount}.":
-            "Selling via site and topping up Steam is more profitable. "
-            "Extra Steam balance: {amount}.",
-        "Selling on Steam Market is more profitable. "
-        "Extra Steam balance: {amount}.":
-            "Selling on Steam Market is more profitable. "
-            "Extra Steam balance: {amount}.",
-        "Both options yield the same Steam balance.":
-            "Both options yield the same Steam balance.",
-        "MODE4_FORMULAS":
-            "**Side A — Sell on site, top up Steam:**\n"
-            "- Gross revenue = site sell price × qty\n"
-            "- After sales fee = gross × (1 − sales fee% / 100)\n"
-            "- Real money = after sales fee × (1 − withdrawal fee% / 100) − fixed fee\n"
-            "- **Steam balance (A)** = real money × (1 + top-up profit% / 100)\n\n"
-            "**Side B — Sell on Steam Market directly:**\n"
-            "- **Steam balance (B)** = seller's cut from Steam Market × qty\n"
-            "  *(Steam takes ~15% for CS2: 10% publisher + 5% platform; "
-            "  for integer currencies the exact Valve rounding model is used)*\n\n"
-            "**Comparison:** whichever side gives more Steam balance is recommended.",
-        # --- Режим 5 ---
-        "Best rarity to buy (collection)": "Best rarity to buy (collection)",
-        "We rank which rarity in a collection is the best buy, based on the price ratio "
-        "between adjacent rarities (10 lower-rarity items trade up into 1 higher-rarity item).":
-            "We rank which rarity in a collection is the best buy, based on the price ratio "
-            "between adjacent rarities (10 lower-rarity items trade up into 1 higher-rarity item).",
-        "Prices in one currency; use a single float tier (preferably the lowest). Leave a rarity at 0 to exclude it from the collection.":
-            "Prices in one currency; use a single float tier (preferably the lowest). Leave a rarity at 0 to exclude it from the collection.",
-        "Rarity prices": "Rarity prices",
-        "Price (0 = not in collection)": "Price (0 = not in collection)",
-        "Rarity": "Rarity",
-        "Price": "Price",
-        "Ratio": "Ratio",
-        "Rank": "Rank",
-        "Comment": "Comment",
-        "Enter at least two rarity prices to compare.": "Enter at least two rarity prices to compare.",
-        "Best buy: {rarity} (rank {rank})": "Best buy: {rarity} (rank {rank})",
-        "Ranking (higher = better buy)": "Ranking (higher = better buy)",
-        "{n}× this rarity = one rarity above": "{n}× this rarity = one rarity above",
-        "this rarity = {n}× the rarity below": "this rarity = {n}× the rarity below",
-        "rarity_consumer": "Consumer Grade (grey)",
-        "rarity_industrial": "Industrial Grade (light blue)",
-        "rarity_milspec": "Mil-Spec (blue)",
-        "rarity_restricted": "Restricted (purple)",
-        "rarity_classified": "Classified (pink)",
-        "rarity_covert": "Covert (red)",
-        "rk_over": "overpriced — bad buy",
-        "rk_over_slight": "slightly overpriced",
-        "rk_normal": "normal average ratio",
-        "rk_good": "a bit better than average",
-        "rk_under": "underpriced — good buy",
-        "rk_under_susp": "underpriced, suspicious — check liquidity",
-        "rk_exp": "expensive vs lower tier",
-        "rk_exp_slight": "a bit expensive",
-        "rk_cheap": "cheap vs lower tier — good buy",
-        "rk_cheap_susp": "very cheap, suspicious — check liquidity",
-        "rk_over_strong": "strongly overpriced — bad buy",
-        "rk_below": "below average",
-        "Site": "Site",
-        "Steam Market": "Steam Market",
-        "The price shown to buyers on the Steam Market.": "The price shown to buyers on the Steam Market.",
-        "How the ranking works": "How the ranking works",
-        "rk_exp_strong": "very expensive vs the lower tier",
-        "cleanliness": "cleanliness",
-        "floor (cheapest)": "floor (cheapest)",
-        "cleanliness premium": "cleanliness premium",
-        "unit": "unit",
-        "pricier and not cleaner — not worth it": "pricier and not cleaner — not worth it",
-        "score": "score",
-        "cleanliness premium: n/a (add a 2nd float to compare)": "cleanliness premium: n/a (add a 2nd float to compare)",
-        "cleanliness premium: n/a (the cheapest is already the cleanest)": "cleanliness premium: n/a (the cheapest is already the cleanest)",
-        "cheapest cleanliness {b}/{u} ({skin}) · avg {a}/{u}": "cheapest cleanliness {b}/{u} ({skin}) · avg {a}/{u}",
-        "cleanliness premium: n/a (skins need ≥2 floats)": "cleanliness premium: n/a (skins need ≥2 floats)",
-        "Score 0–100 is experimental (relative within a skin, 50/50 clean/cheap).": "Score 0–100 is experimental (relative within a skin, 50/50 clean/cheap).",
-        'Advanced float analysis (float & cut)':
-            'Advanced float analysis (float & cut)',
-        'Advanced mode: for each rarity add skins with their float cap and one or more quality records. The ranking then also accounts for float economics — the contract value of cleanliness. (The single-currency note still applies.)':
-            'Advanced mode: for each rarity add skins with their float cap and one or more quality records. The ranking then also accounts for float economics — the contract value of cleanliness. (The single-currency note still applies.)',
-        'Default float = midpoint of (wear ∩ cap), instead of worst-in-wear':
-            'Default float = midpoint of (wear ∩ cap), instead of worst-in-wear',
-        "m5a_midpoint_label":
-            "Use the wear's MIDPOINT float instead of its worst (dirtiest) — for records without an exact float",
-        "m5a_midpoint_help":
-            "Affects only quality records where you did NOT enter an exact float. OFF (default): the record's "
-            "float is taken as the WORST (dirtiest) end of (wear ∩ cap) — the conservative, cheapest-to-obtain "
-            "assumption. ON: the float is the MIDPOINT of (wear ∩ cap) — an average assumption. Records with an "
-            "exact float entered are unaffected either way.",
-        "m5_tp_help":
-            "When on, you can enter a Steam-market price next to each item. Each price is converted to your "
-            "real currency (via the rates and the Steam top-up bonus), and for every item the CHEAPER of the "
-            "external-market price and the Steam price is used in the ranking. Off: only external prices, one currency.",
-        'Skins in this rarity':
-            'Skins in this rarity',
-        'Skin':
-            'Skin',
-        'Skin name (optional)':
-            'Skin name (optional)',
-        'Float cap min':
-            'Float cap min',
-        'Float cap max':
-            'Float cap max',
-        'Invalid cap: need 0 ≤ min < max ≤ 1.':
-            'Invalid cap: need 0 ≤ min < max ≤ 1.',
-        'Quality records':
-            'Quality records',
-        'Quality (wear)':
-            'Quality (wear)',
-        'Exact float':
-            'Exact float',
-        'Float value':
-            'Float value',
-        'contract float':
-            'contract float',
-        'float-value':
-            'float-value',
-        'Auto (cheapest by price)':
-            'Auto (cheapest by price)',
-        'Record':
-            'Record',
-        'Record used in the rarity aggregate':
-            'Record used in the rarity aggregate',
-        'Add at least two rarities, each with a valid priced skin, to compare.':
-            'Add at least two rarities, each with a valid priced skin, to compare.',
-        'Ranking with float economics (higher = better buy)':
-            'Ranking with float economics (higher = better buy)',
-        'Float bonus':
-            'Float bonus',
-        'Trade-up & float details':
-            'Trade-up & float details',
-        'craft up':
-            'craft up',
-        "News":
-            "News",
-        "Show all news":
-            "Show all news",
-        "m5a_cands_title":
-            "Filler candidates: what to buy ({n})",
-        "m5a_cands_hint_cheapest":
-            "Sorted by price — cheapest first. The contract uses the top row (✅). Each row is "
-            "a contract of 10 copies of that exact record. Return = output ÷ input: 100% = you "
-            "get your money back (break-even), 105% = +5% profit, below 100% = a loss.",
-        "m5a_cands_hint_best":
-            "Sorted by return — best price/quality first. The contract uses the top row (✅). "
-            "Each row is a contract of 10 copies of that exact skin+quality. Return = output ÷ "
-            "input: 100% = break-even, 105% = +5% profit, below 100% = a loss.",
-        "m5a_col_skin":
-            "Skin",
-        "m5a_col_wear":
-            "Quality",
-        "m5a_col_float":
-            "Float",
-        "m5a_col_cost":
-            "Input ×10",
-        "m5a_col_eout":
-            "Avg output",
-        "m5a_tpl_caption":
-            "Loading fills every field for this collection (fully editable). It OVERWRITES "
-            "the current advanced-mode input. Prices are approximate USD starting values — "
-            "update them to the current market before relying on the result.",
-        "m5a_tpl_loaded_msg":
-            "Loaded template: {name} · update the prices to the current market.",
-        "m5a_craft_line":
-            "(filler: {skin} · {wear} · float {f}, w={w} · {price} ×{n} = {cost} → "
-            "avg output {eout} · return {roi}% (profit {profit}%))",
-        "m5a_col_roi":
-            "Return (ROI)",
-        "m5a_cmode_label":
-            "Contract calculation (fillers)",
-        "m5a_cmode_cheapest":
-            "By cheapest fillers — the contract uses the cheapest record at its real float",
-        "m5a_cmode_best":
-            "By best price/quality — every record is tried, the best-ROI filler is used",
-        "m5a_cmode_help":
-            "Both modes run the contract on your ACTUAL records (10 copies of one filler). "
-            "The expected output is the average over ALL skins of the next rarity, each "
-            "priced at the float the contract yields from the filler's real float "
-            "(1 skin = 1 outcome). 'Cheapest' answers: what does the classic cheapest-filler "
-            "craft give? 'Best price/quality' additionally tries every entered record as the "
-            "filler and picks the one with the best return — the best craft-purchase option. "
-            "Return is output ÷ input (100% = break-even, 105% = +5% profit).",
-        'clean pays off — worth buying low-float fillers':
-            'clean pays off — worth buying low-float fillers',
-        "don't overpay for clean — a dirty filler gives the same output":
-            "don't overpay for clean — a dirty filler gives the same output",
-        'trade-up into the next rarity is unprofitable':
-            'trade-up into the next rarity is unprofitable',
-        'MODE5_ADV_NOTE':
-            "Advanced mode: a rarity's price for ranking is its CHEAPEST record (the filler "
-            "price). Float value is the cleanliness premium WITHIN a skin: the floor is the "
-            "skin's cheapest record, and for a record cleaner than the floor the premium = "
-            "(price − floor price)/(cleanliness − floor cleanliness) = $ per extra unit of "
-            "cleanliness (needs ≥2 floats; lower = cheaper cleanliness = less overpay). One "
-            "record → n/a. The float bonus comes from the contract ROI into the next rarity "
-            "(10→1) computed on your ACTUAL records per the selected mode: 'cheapest' uses "
-            "the cheapest record at its real float, 'best price/quality' tries every record "
-            "and uses the best-return filler; the output is averaged over ALL next-rarity skins "
-            "priced at the produced float. Return is shown as output ÷ input (100% = "
-            "break-even, 105% = +5% profit); the rank bonus only applies above 100%. "
-            "Contract float weight w = (float − "
-            "cap_min)/(cap_max − cap_min). In advanced mode there is no 'beautiful/liquid' "
-            "checkbox — its role is played by the float bonus from contract ROI (the checkbox "
-            "described above applies to the simple mode).",
-        "Enter the price you consider fair for each rarity. Tick the box if you "
-        "find that rarity's skins beautiful or especially liquid.":
-            "Enter the price you consider fair for each rarity. Tick the box if you "
-            "find that rarity's skins beautiful or especially liquid.",
-        "Beautiful / liquid?": "Beautiful / liquid?",
-        "rk_top_note": "(Top rarity: it can't be crafted up and its supply only grows, "
-                       "so its rank carries a penalty.)",
-        "MODE5_FORMULAS":
-            "For each rarity except the highest, ratio = **price(rarity above) / price(this rarity)** "
-            "— how many of this rarity, by price, equal one item of the rarity above. A trade-up turns "
-            "10 of one rarity into 1 of the next, so a **bigger ratio** means this rarity is cheap "
-            "relative to what it becomes → a better buy:\n\n"
-            "- ≤ 2 → **F** (strongly overpriced)\n"
-            "- 2–3.5 → **E** (overpriced)\n"
-            "- 3.5–4.5 → **D** (below average)\n"
-            "- 4.5–5.5 → **C** (average)\n"
-            "- 5.5–6.5 → **B**\n"
-            "- 6.5–8 → **A** (this tier underpriced)\n"
-            "- 8–10 → **A+**\n"
-            "- > 10 → **A++** (unusual — 10 of these craft 1 above; check the higher tier's liquidity)\n\n"
-            "The **highest** rarity is scored in reverse (nothing is above it): its ratio vs the tier "
-            "below is flipped, then a penalty is applied (−2 if it lands on A or above, −1 for B/C/D/E) "
-            "because the top rarity can't be crafted upward and its supply only grows.\n\n"
-            "**Beauty / liquidity:** ticking a rarity adds +0.5 to its ratio and to the tier one below, "
-            "+0.25 to the tier two below (nothing three below); it never affects a rarity above the "
-            "ticked one. For the top rarity the bonus instead improves its reversed score.\n\n"
-            "**Rarity-position adjustments (rank only):** independent of beauty, the rank also shifts by "
-            "position among the rarities you actually entered — these touch ONLY the rank, never the displayed "
-            "ratio or any raw number/comparison. The lowest tier gets +0.25; the top tier an extra −0.5 (on top "
-            "of its reverse penalty); the 2nd-from-top −0.5, 3rd-from-top −0.35, 4th-from-top −0.25. In a small "
-            "collection one tier can be both 'lowest' and 'k-th from top' — the shifts simply add up.\n\n"
-            "Empty/0 prices are skipped, so collections missing some rarities are handled. "
-            "This is a heuristic on the prices you enter, not financial advice.",
-    },
-    "ru": {
-        # --- сайдбар / общее ---
-        "Settings": "Настройки",
-        "Language": "Язык",
-        "Display currency": "Валюта отображения",
-        "Advanced currency mode (cross-rates)": "Продвинутый режим валют (кросс-курсы)",
-        "When enabled, all modes let you set separate currencies for your card, the site, and Steam.":
-            "Если включено, во всех режимах можно задать отдельные валюты для карты, сайта и Steam.",
-        "CS2 Skin Investing Toolkit": "Инструментарий инвестора CS2",
-        "© 2026 Yev Capital. Not affiliated with Valve Corp. Steam and CS2 are trademarks of Valve Corporation.":
-            "© 2026 Yev Capital. Не связано с Valve Corp. Steam и CS2 являются торговыми марками Valve Corporation.",
-        "This is an analytical tool, not financial advice. All investments carry risks.":
-            "Это аналитический инструмент, а не финансовая рекомендация. Все инвестиции сопряжены с рисками.",
-        "All prices are entered manually. This is a calculator, not financial advice.":
-            "Все цены вводятся вручную. Это калькулятор, а не финансовая рекомендация.",
-        "Steam top-up profit, skin purchase and CS2 collection analyzer":
-            "Калькулятор выгоды пополнения Steam, покупок скинов и анализа коллекций CS2",
-        # --- вкладки ---
-        "Balance top-up (profit)": "Пополнение баланса (профит)",
-        "Where to buy cheaper?": "Где купить выгоднее?",
-        # --- кнопка / общие поля ---
-        "Calculate": "Рассчитать",
-        "Press Calculate to see the results.": "Нажмите «Рассчитать», чтобы увидеть результат.",
-        "Quantity": "Количество предметов",
-        # --- блок комиссии ---
-        "Fee template": "Шаблон комиссии сайта",
-        "Presets for popular sites. Manual input is also available.":
-            "Шаблоны популярных сайтов. Также доступен ручной ввод.",
-        "Account for top-up fee": "Учитывать комиссию пополнения",
-        "Top-up fee (%)": "Комиссия пополнения (%)",
-        "Fixed fee (USD)": "Фиксированная комиссия (USD)",
-        "Manual input": "Ручной ввод",
-        "USD fixed fee converted via your existing cross-rate.":
-            "Фиксированная комиссия USD конвертирована по вашему кросс-курсу.",
-        # --- Режим 1 ---
-        "Steam balance top-up calculator": "Калькулятор пополнения баланса Steam",
-        "We calculate the final profit from buying a skin on a third-party site and selling it on the Steam Market.":
-            "Считаем итоговый плюс при покупке скина на стороннем сайте и его продаже на Торговой площадке Steam.",
-        "Purchase (third-party site)": "Покупка (сторонний сайт)",
-        "Skin price on third-party site": "Стоимость скина на стороннем сайте",
-        "Sale (Steam Market)": "Продажа (ТП Steam)",
-        "Steam sale price": "Цена продажи на ТП Steam",
-        "Steam sale fee (%)": "Комиссия Steam при продаже (%)",
-        "Default 15% = 10% CS2 fee + 5% Steam fee.":
-            "По умолчанию 15% = 10% комиссия CS2 + 5% комиссия Steam.",
-        "Currency without cents (integers only)": "Валюта без копеек (целые числа)",
-        "Forces integer Steam pricing. Auto-enabled for ₴ / UAH.":
-            "Включает целочисленные цены Steam. Для ₴ / UAH включается автоматически.",
-        "Cross-currency settings": "Настройки кросс-курсов",
-        "Spent currency (e.g. UAH)": "Валюта затрат (например, UAH)",
-        "Site currency (e.g. USD)": "Валюта сайта (например, USD)",
-        "Steam currency (e.g. EUR)": "Валюта Steam (например, EUR)",
-        "Rate: how many {a} in 1 {b}": "Курс: сколько {a} в 1 {b}",
-        "Both rates are in the spent currency per 1 unit (a common base).":
-            "Оба курса заданы в валюте затрат за 1 единицу (приведение к единому знаменателю).",
-        "Site cost": "Затраты на сайте",
-        "Steam proceeds": "Получено в Steam",
-        "Steam cost": "Стоимость в Steam",
-        "Results": "Результаты",
-        "Real spent": "Реальные затраты",
-        "Steam received": "Получено на Steam",
-        "Net profit": "Чистый плюс",
-        "Buyer pays {buyer} · you receive {seller} (per item)":
-            "Покупатель платит {buyer} · вы получаете {seller} (за 1 шт.)",
-        "Steam fees are floored to whole units with a 1-unit minimum, following Steam's exact fee model.":
-            "Комиссии Steam округляются вниз до целых единиц с минимумом в одну единицу — по точной модели Steam.",
-        "Price {x} is impossible in Steam for integer currencies. Rounded to the nearest possible: {y}.":
-            "Цена {x} невозможна в Steam для целочисленных валют. Округлено до ближайшей возможной: {y}.",
-        "Steam has no fractions for this currency; price rounded to {y}.":
-            "В этой валюте у Steam нет дробной части; цена округлена до {y}.",
-        "Enter a skin price to see the calculation.": "Введите стоимость скина, чтобы увидеть расчёт.",
-        "Top-up in profit: +{amount} ({percent}).": "Пополнение в плюс: +{amount} ({percent}).",
-        "Top-up at a loss: {amount} ({percent}).": "Пополнение в минус: {amount} ({percent}).",
-        "Break-even result.": "Нулевой результат — выходите в ноль.",
-        "Calculation formulas": "Формулы расчёта",
-        "MODE1_FORMULAS":
-            "- **Реальные затраты** = (цена на сайте × кол-во) × (1 + %комиссии / 100) + фикса USD (конвертированная)\n"
-            "- **Получено на Steam** = промежуточный итог продавца × кол-во. Итог выводится из цены "
-            "покупателя по точной модели Steam: каждая комиссия округляется вниз (отбрасывание дробной "
-            "части) с минимумом в одну единицу и считается в наименьшей единице валюты — целые единицы "
-            "для целочисленных валют, копейки/центы для остальных.\n"
-            "- **Чистый плюс** = Получено на Steam − Реальные затраты\n"
-            "- **Процент плюса** = Чистый плюс / Реальные затраты × 100\n\n"
-            "В продвинутом режиме каждая сторона сначала считается в своей валюте, и только потом "
-            "приводится к валюте затрат (базовой) по вашим курсам.",
-        # --- Режим 2 ---
-        "We compare buying a skin directly on a third-party site with real money versus buying it on the Steam Market with a balance topped up 'in profit'.":
-            "Сравниваем покупку скина напрямую на стороннем сайте за реальные деньги "
-            "против покупки на ТП Steam за баланс, пополненный «в плюс».",
-        "Buy on Steam Market": "Покупка на ТП Steam",
-        "Current Steam Market price": "Текущая стоимость скина на ТП Steam",
-        "Steam top-up profit (%)": "Процент плюса пополнения Steam (%)",
-        "How profitably you topped up Steam earlier. Example: spent 10 real, got 15 on balance → 50% profit.":
-            "Насколько выгодно вы ранее пополнили Steam. Например: потратили 10 реальных, "
-            "получили 15 на баланс → плюс 50%.",
-        "Buy on third-party site": "Покупка на стороннем сайте",
-        "Results comparison": "Результаты сравнения",
-        "Real price (third-party site)": "Реальная цена (сторонний сайт)",
-        "Real price (Steam, with profit)": "Реальная цена (Steam, с учётом плюса)",
-        "Enter data to see the comparison.": "Введите данные, чтобы увидеть сравнение.",
-        "Cheaper to buy on Steam. Savings: {amount}.": "Выгоднее купить в Steam. Экономия: {amount}.",
-        "Cheaper to buy on the third-party site. Savings: {amount}.":
-            "Выгоднее купить на стороннем сайте. Экономия: {amount}.",
-        "Both options cost the same in real money.": "Оба варианта равнозначны по реальной стоимости.",
-        "MODE2_FORMULAS":
-            "- **Реальная цена (сайт)** = (цена на сайте × кол-во) × (1 + %комиссии / 100) + фикса USD (конвертированная)\n"
-            "- **Реальная цена (Steam)** = (цена на ТП × кол-во) / (1 + %плюса / 100)\n"
-            "- **Экономия** = модуль разницы между двумя реальными ценами (в базовой валюте при кросс-курсах).",
-        # --- Режим 3 ---
-        "Withdrawal (Cashout)": "Вывод средств (Cashout)",
-        "Steam balance cashout calculator": "Калькулятор вывода баланса Steam",
-        "We calculate how much real money you receive by buying a skin on the Steam Market, "
-        "selling it on a third-party site, and withdrawing the proceeds.":
-            "Считаем, сколько реальных денег вы получите, купив скин на Торговой площадке Steam, "
-            "продав его на стороннем сайте и выведя выручку.",
-        "Purchase (Steam Market)": "Покупка (ТП Steam)",
-        "Steam purchase price": "Цена покупки в Steam",
-        "Withdrawal (third-party site)": "Вывод (сторонний сайт)",
-        "Site sell price": "Цена продажи на сайте",
-        "Sales fee (%)": "Комиссия сайта за продажу (%)",
-        "Withdrawal fee (%)": "Комиссия за вывод (%)",
-        "Withdrawal fixed fee (USD)": "Фиксированная комиссия за вывод (USD)",
-        "Total Steam spent": "Потрачено Steam баланса",
-        "Real money received": "Получено реальных денег",
-        "Cashout ratio": "Коэффициент вывода",
-        "Net profit / loss": "Чистая прибыль / убыток",
-        "Gross site revenue": "Грязная выручка на сайте",
-        "After sales fee": "После комиссии за продажу",
-        "Enter prices to see the cashout calculation.":
-            "Введите цены, чтобы увидеть расчёт вывода.",
-        "The higher the cashout ratio, the more of your Steam balance reaches your card.":
-            "Чем выше коэффициент вывода, тем большая часть баланса Steam доходит до карты.",
-        "MODE3_FORMULAS":
-            "- **Потрачено баланса Steam** = цена покупки в Steam × кол-во\n"
-            "- **Реальные затраты Steam** = потрачено баланса Steam / (1 + % плюса пополнения / 100)  *(только если задан % плюса)*\n"
-            "- **Грязная выручка на сайте** = цена продажи на сайте × кол-во\n"
-            "- **После комиссии за продажу** = грязная выручка × (1 − %комиссии продажи / 100)\n"
-            "- **Получено реальных денег** = после комиссии за продажу × (1 − %комиссии вывода / 100) − фикса USD (конвертированная)\n"
-            "- **Коэффициент вывода** = получено реальных денег / Реальные затраты Steam × 100  *(или / баланс Steam, если плюс не задан)*\n"
-            "- **Чистая прибыль / убыток** = получено реальных денег − Реальные затраты Steam\n\n"
-            "В продвинутом режиме сторона сайта и сторона Steam считаются каждая в своей валюте, "
-            "а затем приводятся к базовой валюте (карты) по вашим курсам.",
-        "Real Steam cost (with top-up)": "Реальные затраты Steam (с плюсом)",
-        "Effective cashout ratio": "Эффективный коэффициент вывода",
-        "Top-up profit factored in. Ratio > 100% means you profit even after cashing out.":
-            "Учтён плюс пополнения. Коэффициент > 100% означает, что вы в плюсе даже после вывода.",
-        # --- Режим 4 ---
-        "Where to sell more profitably?": "Где продать выгоднее?",
-        "We compare selling a skin on a third-party site (then topping up Steam at a profit) "
-        "versus selling it directly on the Steam Market.":
-            "Сравниваем продажу скина на стороннем сайте (с последующим пополнением Steam в плюс) "
-            "и продажу напрямую через Steam Market.",
-        "Sell on third-party site → top up Steam": "Продать на стороннем сайте → пополнить Steam",
-        "Sell on Steam Market directly": "Продать на Steam Market напрямую",
-        "Steam sell price (buyer pays)": "Цена на Steam Market (платит покупатель)",
-        "Steam Market fee (%)": "Комиссия Steam Market (%)",
-        "Steam balance via site (with top-up)": "Баланс Steam через сайт (с пополнением)",
-        "Steam balance via Steam Market": "Баланс Steam через Steam Market",
-        "Real money from site: {amount}": "Реальных денег с сайта: {amount}",
-        "Selling via site and topping up Steam is more profitable. "
-        "Extra Steam balance: {amount}.":
-            "Выгоднее продать через сайт и пополнить Steam. "
-            "Дополнительный баланс: {amount}.",
-        "Selling on Steam Market is more profitable. "
-        "Extra Steam balance: {amount}.":
-            "Выгоднее продать на Steam Market напрямую. "
-            "Дополнительный баланс: {amount}.",
-        "Both options yield the same Steam balance.":
-            "Оба варианта дают одинаковый Steam-баланс.",
-        "MODE4_FORMULAS":
-            "**Вариант А — Продать на сайте, пополнить Steam:**\n"
-            "- Грязная выручка = цена продажи на сайте × кол-во\n"
-            "- После комиссии продажи = грязная выручка × (1 − %комиссии продажи / 100)\n"
-            "- Реальные деньги = после комиссии × (1 − %комиссии вывода / 100) − фикса\n"
-            "- **Баланс Steam (А)** = реальные деньги × (1 + %плюса пополнения / 100)\n\n"
-            "**Вариант Б — Продать на Steam Market напрямую:**\n"
-            "- **Баланс Steam (Б)** = выручка продавца с учётом комиссии Steam × кол-во\n"
-            "  *(Steam удерживает ~15% для CS2: 10% издательская + 5% площадка; "
-            "  для целочисленных валют применяется точная модель округления Valve)*\n\n"
-            "**Сравнение:** рекомендуется вариант, дающий больший Steam-баланс.",
-        # --- Режим 5 ---
-        "Best rarity to buy (collection)": "Лучшее качество для покупки (коллекция)",
-        "We rank which rarity in a collection is the best buy, based on the price ratio "
-        "between adjacent rarities (10 lower-rarity items trade up into 1 higher-rarity item).":
-            "Оцениваем, какое качество в коллекции выгоднее покупать, по соотношению цен соседних "
-            "качеств (10 предметов нижнего качества через контракт обмена дают 1 предмет выше).",
-        "Prices in one currency; use a single float tier (preferably the lowest). Leave a rarity at 0 to exclude it from the collection.":
-            "Цены в одной валюте; используй одно качество флоата (желательно самое низкое). Оставь 0, чтобы исключить редкость из коллекции.",
-        "Rarity prices": "Цены по качествам",
-        "Price (0 = not in collection)": "Цена (0 = нет в коллекции)",
-        "Rarity": "Качество",
-        "Price": "Цена",
-        "Ratio": "Соотношение",
-        "Rank": "Ранг",
-        "Comment": "Комментарий",
-        "Enter at least two rarity prices to compare.":
-            "Введи цены минимум для двух качеств для сравнения.",
-        "Best buy: {rarity} (rank {rank})": "Выгоднее всего покупать: {rarity} (ранг {rank})",
-        "Ranking (higher = better buy)": "Рейтинг (выше — выгоднее покупать)",
-        "{n}× this rarity = one rarity above": "{n}× этого качества = одно качество выше",
-        "this rarity = {n}× the rarity below": "это качество = {n}× качества ниже",
-        "rarity_consumer": "Ширпотреб (серое)",
-        "rarity_industrial": "Промышленное (голубое)",
-        "rarity_milspec": "Армейское (синее)",
-        "rarity_restricted": "Запрещённое (фиолетовое)",
-        "rarity_classified": "Засекреченное (розовое)",
-        "rarity_covert": "Тайное (красное)",
-        "rk_over": "переоценено — невыгодно покупать",
-        "rk_over_slight": "слегка переоценено",
-        "rk_normal": "нормальное среднее соотношение",
-        "rk_good": "чуть лучше среднего",
-        "rk_under": "недооценено — выгодно покупать",
-        "rk_under_susp": "недооценено, подозрительно — проверь ликвидность",
-        "rk_exp": "дорогое относительно качества ниже",
-        "rk_exp_slight": "дороговато",
-        "rk_cheap": "дёшево относительно качества ниже — выгодно",
-        "rk_cheap_susp": "очень дёшево, подозрительно — проверь ликвидность",
-        "rk_over_strong": "сильно переоценено — невыгодно покупать",
-        "rk_below": "ниже среднего",
-        "Site": "Сайт",
-        "Steam Market": "Steam Market",
-        "The price shown to buyers on the Steam Market.": "Цена, которую видят покупатели на Торговой площадке Steam.",
-        "How the ranking works": "Как считается ранг",
-        "rk_exp_strong": "очень дорогое относительно качества ниже",
-        "cleanliness": "чистота",
-        "floor (cheapest)": "пол (самый дешёвый)",
-        "cleanliness premium": "наценка за чистоту",
-        "unit": "ед.",
-        "pricier and not cleaner — not worth it": "дороже и не чище — невыгодно",
-        "score": "балл",
-        "cleanliness premium: n/a (add a 2nd float to compare)": "наценка за чистоту: н/д (добавьте 2-й флоат для сравнения)",
-        "cleanliness premium: n/a (the cheapest is already the cleanest)": "наценка за чистоту: н/д (самый дешёвый уже самый чистый)",
-        "cheapest cleanliness {b}/{u} ({skin}) · avg {a}/{u}": "дешевле всего чистота {b}/{u} ({skin}) · в среднем {a}/{u}",
-        "cleanliness premium: n/a (skins need ≥2 floats)": "наценка за чистоту: н/д (нужно ≥2 флоата у скинов)",
-        "Score 0–100 is experimental (relative within a skin, 50/50 clean/cheap).": "Балл 0–100 — экспериментальный (относительный внутри скина, 50/50 чистота/цена).",
-        'Advanced float analysis (float & cut)':
-            'Продвинутый анализ флоата (флоат и резка)',
-        'Advanced mode: for each rarity add skins with their float cap and one or more quality records. The ranking then also accounts for float economics — the contract value of cleanliness. (The single-currency note still applies.)':
-            'Продвинутый режим: для каждой редкости добавь скины с их резкой флоата и одной или несколькими записями качеств. Тогда ранжирование учитывает и экономику флоата — контрактную ценность чистоты. (Условие одной валюты по-прежнему действует.)',
-        'Default float = midpoint of (wear ∩ cap), instead of worst-in-wear':
-            'Дефолтный флоат = середина (качество ∩ резка), вместо «худшего в качестве»',
-        "m5a_midpoint_label":
-            "Брать СЕРЕДИНУ флоата качества вместо «худшего» (для записей без точного флоата)",
-        "m5a_midpoint_help":
-            "Влияет только на записи качества, где НЕ задан точный флоат. ВЫКЛ (по умолчанию): флоат берётся "
-            "как «худший» (самый грязный) край пересечения (качество ∩ резка) — консервативная оценка, такой "
-            "предмет проще всего получить. ВКЛ: флоат берётся как СЕРЕДИНА пересечения (качество ∩ резка) — "
-            "усреднённая оценка. На записи с введённым точным флоатом галочка не влияет.",
-        "m5_tp_help":
-            "Когда включено, рядом с каждым предметом можно ввести цену из Steam. Каждая цена приводится к "
-            "твоей реальной валюте (через курсы и бонус пополнения Steam), и для каждого предмета в ранжировании "
-            "берётся ДЕШЕВЛЕ из цены внешнего маркета и цены Steam. Выкл: только внешние цены, одна валюта.",
-        "Account for Steam (TP) prices":
-            "Учёт цен Steam (ТП)",
-        "Steam (TP) pricing settings":
-            "Настройки цен Steam (ТП)",
-        "External sites currency":
-            "Валюта внешних площадок",
-        "Steam currency":
-            "Валюта Steam",
-        "Real currency (you pay in)":
-            "Реальная валюта (которой платишь)",
-        "Steam top-up bonus %":
-            "Бонус пополнения Steam, %",
-        "Prices are converted to your real currency; for each item the CHEAPER of market vs Steam is used.":
-            "Цены приводятся к реальной валюте; для каждого предмета берётся ДЕШЕВЛЕ из маркета и Steam.",
-        "Steam price":
-            "Цена Steam",
-        "price from Steam":
-            "цена из Steam",
-        "price from market":
-            "цена с внешнего маркета",
-        'Skins in this rarity':
-            'Скинов в этой редкости',
-        'Skin':
-            'Скин',
-        'Skin name (optional)':
-            'Название скина (необязательно)',
-        'Float cap min':
-            'Резка флоата, min',
-        'Float cap max':
-            'Резка флоата, max',
-        'Invalid cap: need 0 ≤ min < max ≤ 1.':
-            'Некорректная резка: нужно 0 ≤ min < max ≤ 1.',
-        'Quality records':
-            'Записей качества',
-        'Quality (wear)':
-            'Качество (износ)',
-        'Exact float':
-            'Точный флоат',
-        'Float value':
-            'Значение флоата',
-        'contract float':
-            'контрактный флоат',
-        'float-value':
-            'стоимость за флоат',
-        'Auto (cheapest by price)':
-            'Авто (самая дешёвая по цене)',
-        'Record':
-            'Запись',
-        'Record used in the rarity aggregate':
-            'Запись для агрегата редкости',
-        'Add at least two rarities, each with a valid priced skin, to compare.':
-            'Добавь минимум две редкости с валидным скином с ценой для сравнения.',
-        'Ranking with float economics (higher = better buy)':
-            'Ранжирование с учётом экономики флоата (выше = выгоднее)',
-        'Float bonus':
-            'Флоат-бонус',
-        'Trade-up & float details':
-            'Контракты и детали флоата',
-        'craft up':
-            'крафт вверх',
-        "News":
-            "Новости",
-        "Show all news":
-            "Показать все новости",
-        "m5a_cands_title":
-            "Кандидаты-филлеры: что покупать ({n})",
-        "m5a_cands_hint_cheapest":
-            "Отсортировано по цене — сначала самые дешёвые. Контракт берёт верхнюю строку (✅). "
-            "Каждая строка = контракт из 10 копий именно этой записи. Возврат = выход ÷ вход: "
-            "100% = вложенное вернулось (в ноль), 105% = +5% прибыли, ниже 100% = убыток.",
-        "m5a_cands_hint_best":
-            "Отсортировано по возврату — сначала лучшее соотношение цена/качество. Контракт берёт "
-            "верхнюю строку (✅). Каждая строка = контракт из 10 копий этого скина в этом качестве. "
-            "Возврат = выход ÷ вход: 100% = в ноль, 105% = +5% прибыли, ниже 100% = убыток.",
-        "m5a_col_skin":
-            "Скин",
-        "m5a_col_wear":
-            "Качество",
-        "m5a_col_float":
-            "Флоат",
-        "m5a_col_cost":
-            "Вход ×10",
-        "m5a_col_eout":
-            "Ср. выход",
-        "Collection template":
-            "Шаблон коллекции",
-        "Load template":
-            "Загрузить шаблон",
-        "m5a_tpl_caption":
-            "Загрузка заполняет все поля этой коллекции (всё редактируемо). Она ПЕРЕЗАПИСЫВАЕТ "
-            "текущий ввод продвинутого режима. Цены — ориентировочные стартовые "
-            "значения (USD); перед использованием обнови их под текущий рынок.",
-        "m5a_tpl_loaded_msg":
-            "Загружен шаблон: {name} · обнови цены под текущий рынок.",
-        "m5a_craft_line":
-            "(филлер: {skin} · {wear} · флоат {f}, w={w} · {price} ×{n} = {cost} → "
-            "ср. выход {eout} · возврат {roi}% (прибыль {profit}%))",
-        "m5a_col_roi":
-            "Возврат (ROI)",
-        "m5a_cmode_label":
-            "Расчёт контрактов (филлеры)",
-        "m5a_cmode_cheapest":
-            "По самым дешёвым — контракт из самой дешёвой записи с её реальным флоатом",
-        "m5a_cmode_best":
-            "По лучшему соотношению цена/качество — перебираются все записи, берётся филлер с лучшим ROI",
-        "m5a_cmode_help":
-            "Оба режима считают контракт на твоих РЕАЛЬНЫХ записях (10 копий одного филлера). "
-            "Ожидаемый выход — среднее по ВСЕМ скинам следующей редкости, каждый оценён на "
-            "флоате, который даст контракт от реального флоата филлера (1 скин = 1 исход). "
-            "«По самым дешёвым» отвечает: что даёт классический крафт из самых дешёвых филлеров? "
-            "«По лучшему соотношению» дополнительно пробует каждую введённую запись как филлер "
-            "и берёт запись с лучшим возвратом — лучший вариант для крафта-закупки. Возврат = "
-            "выход ÷ вход (100% = в ноль, 105% = +5% прибыли).",
-        'clean pays off — worth buying low-float fillers':
-            'чистота окупается — есть смысл брать низкофлоатные филлеры',
-        "don't overpay for clean — a dirty filler gives the same output":
-            'не переплачивай за чистоту — грязный филлер даёт тот же выход',
-        'trade-up into the next rarity is unprofitable':
-            'контракт в следующую редкость невыгоден',
-        'MODE5_ADV_NOTE':
-            'Продвинутый режим: цена редкости для ранга — её САМАЯ ДЕШЁВАЯ запись (цена филлеров). Флоат-ценность — это наценка за чистоту ВНУТРИ скина: пол = самая дешёвая запись скина, и для записи чище пола наценка = (цена − цена пола)/(чистота − чистота пола) = $ за доп. единицу чистоты (нужно ≥2 флоата; ниже = дешевле чистота = меньше переплата). Одна запись → н/д. Флоат-бонус берётся из ROI контракта в следующую редкость (10→1), посчитанного на РЕАЛЬНЫХ записях по выбранному режиму: «по самым дешёвым» — самая дешёвая запись с её реальным флоатом, «по лучшему соотношению цена/качество» — перебираются все записи и берётся филлер с лучшим возвратом; выход усредняется по ВСЕМ скинам следующей редкости на полученном флоате. Возврат показывается как выход ÷ вход (100% = в ноль, 105% = +5% прибыли); ранговый бонус даётся только выше 100%. Контрактный вес флоата w = (флоат − cap_min)/(cap_max − cap_min). В продвинутом режиме галочки «красивое/ликвидное» нет — её роль играет флоат-бонус из контрактного ROI (описание галочки выше относится к простому режиму).',
-        "Enter the price you consider fair for each rarity. Tick the box if you "
-        "find that rarity's skins beautiful or especially liquid.":
-            "Укажи цену, которую считаешь справедливой для каждого качества. Отметь галочку, "
-            "если скины этого качества красивые или особенно ликвидные.",
-        "Beautiful / liquid?": "Красивое / ликвидное?",
-        "rk_top_note": "(Высшее качество: его нельзя скрафтить выше, а предложение только "
-                       "растёт, поэтому к рангу применён штраф.)",
-        "MODE5_FORMULAS":
-            "Для каждого качества, кроме высшего, соотношение = **цена качества выше / цена этого "
-            "качества** — сколько штук этого качества по цене равны одному предмету качества выше. "
-            "Контракт превращает 10 предметов одного качества в 1 предмет следующего, поэтому "
-            "**большее соотношение** означает, что качество дёшево относительно того, чем становится "
-            "→ выгоднее покупать:\n\n"
-            "- ≤ 2 → **F** (сильно переоценено)\n"
-            "- 2–3.5 → **E** (переоценено)\n"
-            "- 3.5–4.5 → **D** (ниже среднего)\n"
-            "- 4.5–5.5 → **C** (среднее)\n"
-            "- 5.5–6.5 → **B**\n"
-            "- 6.5–8 → **A** (это качество недооценено)\n"
-            "- 8–10 → **A+**\n"
-            "- > 10 → **A++** (необычно — 10 этих крафтят 1 выше; проверь ликвидность верхнего)\n\n"
-            "**Высшее** качество считается наоборот (выше него ничего нет): его соотношение к качеству "
-            "ниже реверсируется, затем применяется штраф (−2, если попадает на A и выше, −1 для B/C/D/E), "
-            "потому что высшее качество нельзя скрафтить дальше, а его предложение только растёт.\n\n"
-            "**Красота / ликвидность:** галочка добавляет +0.5 к соотношению этого качества и качества "
-            "на 1 ниже, +0.25 к качеству на 2 ниже (на 3 ниже — ничего); на качество выше отмеченного "
-            "бонус не влияет. Для высшего качества бонус, наоборот, улучшает его реверс-оценку.\n\n"
-            "**Позиционные корректировки (только ранг):** независимо от красоты, ранг дополнительно "
-            "сдвигается по позиции среди ВВЕДЁННЫХ редкостей — это влияет ТОЛЬКО на ранг, не на показанный "
-            "ratio и не на сырые цифры/сравнения. Самой нижней +0.25; высшей — дополнительный −0.5 (сверх её "
-            "реверс-штрафа); предпоследней −0.5, пред-предпоследней −0.35, пред-пред-предпоследней −0.25. В "
-            "маленькой коллекции одна редкость может быть и «самой нижней», и «k-й сверху» — сдвиги тогда "
-            "просто складываются.\n\n"
-            "Пустые цены/0 пропускаются, поэтому коллекции без некоторых качеств учитываются. "
-            "Это эвристика по введённым ценам, а не финансовая рекомендация.",
-    },
-    "ua": {
-        # --- сайдбар / загальне ---
-        "Settings": "Налаштування",
-        "Language": "Мова",
-        "Display currency": "Валюта відображення",
-        "Advanced currency mode (cross-rates)": "Розширений режим валют (крос-курси)",
-        "When enabled, all modes let you set separate currencies for your card, the site, and Steam.":
-            "Якщо увімкнено, в усіх режимах можна задати окремі валюти для картки, сайту та Steam.",
-        "CS2 Skin Investing Toolkit": "Інструментарій інвестора CS2",
-        "© 2026 Yev Capital. Not affiliated with Valve Corp. Steam and CS2 are trademarks of Valve Corporation.":
-            "© 2026 Yev Capital. Не пов'язано з Valve Corp. Steam та CS2 є торговими марками Valve Corporation.",
-        "This is an analytical tool, not financial advice. All investments carry risks.":
-            "Це аналітичний інструмент, а не фінансова порада. Усі інвестиції пов'язані з ризиками.",
-        "All prices are entered manually. This is a calculator, not financial advice.":
-            "Усі ціни вводяться вручну. Це калькулятор, а не фінансова порада.",
-        "Steam top-up profit, skin purchase and CS2 collection analyzer":
-            "Калькулятор вигоди поповнення Steam, покупок скінів та аналізу колекцій CS2",
-        # --- вкладки ---
-        "Balance top-up (profit)": "Поповнення балансу (профіт)",
-        "Where to buy cheaper?": "Де купити вигідніше?",
-        # --- кнопка / загальні поля ---
-        "Calculate": "Розрахувати",
-        "Press Calculate to see the results.": "Натисніть «Розрахувати», щоб побачити результат.",
-        "Quantity": "Кількість предметів",
-        # --- блок комісії ---
-        "Fee template": "Шаблон комісії сайту",
-        "Presets for popular sites. Manual input is also available.":
-            "Шаблони популярних сайтів. Також доступне ручне введення.",
-        "Account for top-up fee": "Враховувати комісію поповнення",
-        "Top-up fee (%)": "Комісія поповнення (%)",
-        "Fixed fee (USD)": "Фіксована комісія (USD)",
-        "Manual input": "Ручне введення",
-        "USD fixed fee converted via your existing cross-rate.":
-            "Фіксована комісія USD конвертована за вашим крос-курсом.",
-        # --- Режим 1 ---
-        "Steam balance top-up calculator": "Калькулятор поповнення балансу Steam",
-        "We calculate the final profit from buying a skin on a third-party site and selling it on the Steam Market.":
-            "Рахуємо підсумковий плюс при купівлі скіна на сторонньому сайті та його продажу на Торговому майданчику Steam.",
-        "Purchase (third-party site)": "Купівля (сторонній сайт)",
-        "Skin price on third-party site": "Вартість скіна на сторонньому сайті",
-        "Sale (Steam Market)": "Продаж (ТМ Steam)",
-        "Steam sale price": "Ціна продажу на ТМ Steam",
-        "Steam sale fee (%)": "Комісія Steam при продажу (%)",
-        "Default 15% = 10% CS2 fee + 5% Steam fee.":
-            "За замовчуванням 15% = 10% комісія CS2 + 5% комісія Steam.",
-        "Currency without cents (integers only)": "Валюта без копійок (цілі числа)",
-        "Forces integer Steam pricing. Auto-enabled for ₴ / UAH.":
-            "Вмикає цілочисельні ціни Steam. Для ₴ / UAH вмикається автоматично.",
-        "Cross-currency settings": "Налаштування крос-курсів",
-        "Spent currency (e.g. UAH)": "Валюта витрат (наприклад, UAH)",
-        "Site currency (e.g. USD)": "Валюта сайту (наприклад, USD)",
-        "Steam currency (e.g. EUR)": "Валюта Steam (наприклад, EUR)",
-        "Rate: how many {a} in 1 {b}": "Курс: скільки {a} в 1 {b}",
-        "Both rates are in the spent currency per 1 unit (a common base).":
-            "Обидва курси задані у валюті витрат за 1 одиницю (приведення до спільного знаменника).",
-        "Site cost": "Витрати на сайті",
-        "Steam proceeds": "Отримано в Steam",
-        "Steam cost": "Вартість у Steam",
-        "Results": "Результати",
-        "Real spent": "Реальні витрати",
-        "Steam received": "Отримано на Steam",
-        "Net profit": "Чистий плюс",
-        "Buyer pays {buyer} · you receive {seller} (per item)":
-            "Покупець платить {buyer} · ви отримуєте {seller} (за 1 шт.)",
-        "Steam fees are floored to whole units with a 1-unit minimum, following Steam's exact fee model.":
-            "Комісії Steam округлюються вниз до цілих одиниць з мінімумом в одну одиницю — за точною моделлю Steam.",
-        "Price {x} is impossible in Steam for integer currencies. Rounded to the nearest possible: {y}.":
-            "Ціна {x} неможлива в Steam для цілочисельних валют. Заокруглено до найближчої можливої: {y}.",
-        "Steam has no fractions for this currency; price rounded to {y}.":
-            "У цій валюті Steam не має дробової частини; ціну заокруглено до {y}.",
-        "Enter a skin price to see the calculation.": "Введіть вартість скіна, щоб побачити розрахунок.",
-        "Top-up in profit: +{amount} ({percent}).": "Поповнення в плюс: +{amount} ({percent}).",
-        "Top-up at a loss: {amount} ({percent}).": "Поповнення в мінус: {amount} ({percent}).",
-        "Break-even result.": "Нульовий результат — виходите в нуль.",
-        "Calculation formulas": "Формули розрахунку",
-        "MODE1_FORMULAS":
-            "- **Реальні витрати** = (ціна на сайті × к-сть) × (1 + %комісії / 100) + фікса USD (конвертована)\n"
-            "- **Отримано на Steam** = проміжний підсумок продавця × к-сть. Підсумок виводиться з ціни "
-            "покупця за точною моделлю Steam: кожна комісія округлюється вниз (відкидання дробової "
-            "частини) з мінімумом в одну одиницю і рахується в найменшій одиниці валюти — цілі одиниці "
-            "для цілочисельних валют, копійки/центи для інших.\n"
-            "- **Чистий плюс** = Отримано на Steam − Реальні витрати\n"
-            "- **Відсоток плюса** = Чистий плюс / Реальні витрати × 100\n\n"
-            "У розширеному режимі кожна сторона спочатку рахується у своїй валюті, і лише потім "
-            "приводиться до валюти витрат (базової) за вашими курсами.",
-        # --- Режим 2 ---
-        "We compare buying a skin directly on a third-party site with real money versus buying it on the Steam Market with a balance topped up 'in profit'.":
-            "Порівнюємо купівлю скіна напряму на сторонньому сайті за реальні гроші "
-            "проти купівлі на ТМ Steam за баланс, поповнений «у плюс».",
-        "Buy on Steam Market": "Купівля на ТМ Steam",
-        "Current Steam Market price": "Поточна вартість скіна на ТМ Steam",
-        "Steam top-up profit (%)": "Відсоток плюса поповнення Steam (%)",
-        "How profitably you topped up Steam earlier. Example: spent 10 real, got 15 on balance → 50% profit.":
-            "Наскільки вигідно ви раніше поповнили Steam. Наприклад: витратили 10 реальних, "
-            "отримали 15 на баланс → плюс 50%.",
-        "Buy on third-party site": "Купівля на сторонньому сайті",
-        "Results comparison": "Результати порівняння",
-        "Real price (third-party site)": "Реальна ціна (сторонній сайт)",
-        "Real price (Steam, with profit)": "Реальна ціна (Steam, з урахуванням плюса)",
-        "Enter data to see the comparison.": "Введіть дані, щоб побачити порівняння.",
-        "Cheaper to buy on Steam. Savings: {amount}.": "Вигідніше купити в Steam. Економія: {amount}.",
-        "Cheaper to buy on the third-party site. Savings: {amount}.":
-            "Вигідніше купити на сторонньому сайті. Економія: {amount}.",
-        "Both options cost the same in real money.": "Обидва варіанти рівнозначні за реальною вартістю.",
-        "MODE2_FORMULAS":
-            "- **Реальна ціна (сайт)** = (ціна на сайті × к-сть) × (1 + %комісії / 100) + фікса USD (конвертована)\n"
-            "- **Реальна ціна (Steam)** = (ціна на ТМ × к-сть) / (1 + %плюса / 100)\n"
-            "- **Економія** = модуль різниці між двома реальними цінами (у базовій валюті за крос-курсів).",
-        # --- Режим 3 ---
-        "Withdrawal (Cashout)": "Виведення коштів (Cashout)",
-        "Steam balance cashout calculator": "Калькулятор виведення балансу Steam",
-        "We calculate how much real money you receive by buying a skin on the Steam Market, "
-        "selling it on a third-party site, and withdrawing the proceeds.":
-            "Рахуємо, скільки реальних грошей ви отримаєте, купивши скін на Торговому майданчику Steam, "
-            "продавши його на сторонньому сайті та вивівши виручку.",
-        "Purchase (Steam Market)": "Купівля (ТМ Steam)",
-        "Steam purchase price": "Ціна купівлі в Steam",
-        "Withdrawal (third-party site)": "Виведення (сторонній сайт)",
-        "Site sell price": "Ціна продажу на сайті",
-        "Sales fee (%)": "Комісія сайту за продаж (%)",
-        "Withdrawal fee (%)": "Комісія за виведення (%)",
-        "Withdrawal fixed fee (USD)": "Фіксована комісія за виведення (USD)",
-        "Total Steam spent": "Витрачено Steam балансу",
-        "Real money received": "Отримано реальних грошей",
-        "Cashout ratio": "Коефіцієнт виведення",
-        "Net profit / loss": "Чистий прибуток / збиток",
-        "Gross site revenue": "Брудна виручка на сайті",
-        "After sales fee": "Після комісії за продаж",
-        "Enter prices to see the cashout calculation.":
-            "Введіть ціни, щоб побачити розрахунок виведення.",
-        "The higher the cashout ratio, the more of your Steam balance reaches your card.":
-            "Що вищий коефіцієнт виведення, то більша частина балансу Steam доходить до картки.",
-        "MODE3_FORMULAS":
-            "- **Витрачено балансу Steam** = ціна купівлі в Steam × к-сть\n"
-            "- **Реальні витрати Steam** = витрачено балансу Steam / (1 + % плюса поповнення / 100)  *(лише якщо задано % плюса)*\n"
-            "- **Брудна виручка на сайті** = ціна продажу на сайті × к-сть\n"
-            "- **Після комісії за продаж** = брудна виручка × (1 − %комісії продажу / 100)\n"
-            "- **Отримано реальних грошей** = після комісії за продаж × (1 − %комісії виведення / 100) − фікса USD (конвертована)\n"
-            "- **Коефіцієнт виведення** = отримано реальних грошей / Реальні витрати Steam × 100  *(або / баланс Steam, якщо плюс не задано)*\n"
-            "- **Чистий прибуток / збиток** = отримано реальних грошей − Реальні витрати Steam\n\n"
-            "У розширеному режимі сторона сайту та сторона Steam рахуються кожна у своїй валюті, "
-            "а потім приводяться до базової валюти (картки) за вашими курсами.",
-        "Real Steam cost (with top-up)": "Реальні витрати Steam (з плюсом)",
-        "Effective cashout ratio": "Ефективний коефіцієнт виведення",
-        "Top-up profit factored in. Ratio > 100% means you profit even after cashing out.":
-            "Враховано плюс поповнення. Коефіцієнт > 100% означає, що ви в плюсі навіть після виведення.",
-        # --- Режим 4 ---
-        "Where to sell more profitably?": "Де продати вигідніше?",
-        "We compare selling a skin on a third-party site (then topping up Steam at a profit) "
-        "versus selling it directly on the Steam Market.":
-            "Порівнюємо продаж скіна на сторонньому сайті (з подальшим поповненням Steam у плюс) "
-            "та продаж напряму через Steam Market.",
-        "Sell on third-party site → top up Steam": "Продати на сторонньому сайті → поповнити Steam",
-        "Sell on Steam Market directly": "Продати на Steam Market напряму",
-        "Steam sell price (buyer pays)": "Ціна на Steam Market (платить покупець)",
-        "Steam Market fee (%)": "Комісія Steam Market (%)",
-        "Steam balance via site (with top-up)": "Баланс Steam через сайт (з поповненням)",
-        "Steam balance via Steam Market": "Баланс Steam через Steam Market",
-        "Real money from site: {amount}": "Реальних грошей з сайту: {amount}",
-        "Selling via site and topping up Steam is more profitable. "
-        "Extra Steam balance: {amount}.":
-            "Вигідніше продати через сайт і поповнити Steam. "
-            "Додатковий баланс: {amount}.",
-        "Selling on Steam Market is more profitable. "
-        "Extra Steam balance: {amount}.":
-            "Вигідніше продати на Steam Market напряму. "
-            "Додатковий баланс: {amount}.",
-        "Both options yield the same Steam balance.":
-            "Обидва варіанти дають однаковий Steam-баланс.",
-        "MODE4_FORMULAS":
-            "**Варіант А — Продати на сайті, поповнити Steam:**\n"
-            "- Брудна виручка = ціна продажу на сайті × к-сть\n"
-            "- Після комісії продажу = брудна виручка × (1 − %комісії продажу / 100)\n"
-            "- Реальні гроші = після комісії × (1 − %комісії виведення / 100) − фікса\n"
-            "- **Баланс Steam (А)** = реальні гроші × (1 + %плюса поповнення / 100)\n\n"
-            "**Варіант Б — Продати на Steam Market напряму:**\n"
-            "- **Баланс Steam (Б)** = виручка продавця з урахуванням комісії Steam × к-сть\n"
-            "  *(Steam утримує ~15% для CS2: 10% видавнича + 5% майданчик; "
-            "  для цілочисельних валют застосовується точна модель округлення Valve)*\n\n"
-            "**Порівняння:** рекомендується варіант, що дає більший Steam-баланс.",
-        # --- Режим 5 ---
-        "Best rarity to buy (collection)": "Найкраща якість для купівлі (колекція)",
-        "We rank which rarity in a collection is the best buy, based on the price ratio "
-        "between adjacent rarities (10 lower-rarity items trade up into 1 higher-rarity item).":
-            "Оцінюємо, яку якість у колекції вигідніше купувати, за співвідношенням цін сусідніх "
-            "якостей (10 предметів нижчої якості через контракт обміну дають 1 предмет вище).",
-        "Prices in one currency; use a single float tier (preferably the lowest). Leave a rarity at 0 to exclude it from the collection.":
-            "Ціни в одній валюті; використовуй одну якість флоата (бажано найнижчу). Залиш 0, щоб виключити рідкість з колекції.",
-        "Rarity prices": "Ціни за якостями",
-        "Price (0 = not in collection)": "Ціна (0 = немає в колекції)",
-        "Rarity": "Якість",
-        "Price": "Ціна",
-        "Ratio": "Співвідношення",
-        "Rank": "Ранг",
-        "Comment": "Коментар",
-        "Enter at least two rarity prices to compare.":
-            "Введи ціни мінімум для двох якостей для порівняння.",
-        "Best buy: {rarity} (rank {rank})": "Найвигідніше купувати: {rarity} (ранг {rank})",
-        "Ranking (higher = better buy)": "Рейтинг (вище — вигідніше купувати)",
-        "{n}× this rarity = one rarity above": "{n}× цієї якості = одна якість вище",
-        "this rarity = {n}× the rarity below": "ця якість = {n}× якості нижче",
-        "rarity_consumer": "Ширвжиток (сіре)",
-        "rarity_industrial": "Промислове (блакитне)",
-        "rarity_milspec": "Армійське (синє)",
-        "rarity_restricted": "Заборонене (фіолетове)",
-        "rarity_classified": "Засекречене (рожеве)",
-        "rarity_covert": "Таємне (червоне)",
-        "rk_over": "переоцінено — невигідно купувати",
-        "rk_over_slight": "трохи переоцінено",
-        "rk_normal": "нормальне середнє співвідношення",
-        "rk_good": "трохи краще за середнє",
-        "rk_under": "недооцінено — вигідно купувати",
-        "rk_under_susp": "недооцінено, підозріло — перевір ліквідність",
-        "rk_exp": "дороге відносно якості нижче",
-        "rk_exp_slight": "дорогувато",
-        "rk_cheap": "дешево відносно якості нижче — вигідно",
-        "rk_cheap_susp": "дуже дешево, підозріло — перевір ліквідність",
-        "rk_over_strong": "сильно переоцінено — невигідно купувати",
-        "rk_below": "нижче середнього",
-        "Site": "Сайт",
-        "Steam Market": "Steam Market",
-        "The price shown to buyers on the Steam Market.": "Ціна, яку бачать покупці на Торговій площадці Steam.",
-        "How the ranking works": "Як рахується ранг",
-        "rk_exp_strong": "дуже дороге відносно якості нижче",
-        "cleanliness": "чистота",
-        "floor (cheapest)": "підлога (найдешевший)",
-        "cleanliness premium": "націнка за чистоту",
-        "unit": "од.",
-        "pricier and not cleaner — not worth it": "дорожче і не чистіше — невигідно",
-        "score": "бал",
-        "cleanliness premium: n/a (add a 2nd float to compare)": "націнка за чистоту: н/д (додайте 2-й флоат для порівняння)",
-        "cleanliness premium: n/a (the cheapest is already the cleanest)": "націнка за чистоту: н/д (найдешевший уже найчистіший)",
-        "cheapest cleanliness {b}/{u} ({skin}) · avg {a}/{u}": "найдешевше чистота {b}/{u} ({skin}) · у середньому {a}/{u}",
-        "cleanliness premium: n/a (skins need ≥2 floats)": "націнка за чистоту: н/д (потрібно ≥2 флоата у скінів)",
-        "Score 0–100 is experimental (relative within a skin, 50/50 clean/cheap).": "Бал 0–100 — експериментальний (відносний усередині скіна, 50/50 чистота/ціна).",
-        'Advanced float analysis (float & cut)':
-            'Просунутий аналіз флоата (флоат і різання)',
-        'Advanced mode: for each rarity add skins with their float cap and one or more quality records. The ranking then also accounts for float economics — the contract value of cleanliness. (The single-currency note still applies.)':
-            'Просунутий режим: для кожної рідкості додай скіни з їх різанням флоата та одним чи кількома записами якостей. Тоді ранжування враховує й економіку флоата — контрактну цінність чистоти. (Умова однієї валюти досі діє.)',
-        'Default float = midpoint of (wear ∩ cap), instead of worst-in-wear':
-            'Дефолтний флоат = середина (якість ∩ різання), замість «найгіршого в якості»',
-        "m5a_midpoint_label":
-            "Брати СЕРЕДИНУ флоата якості замість «найгіршого» (для записів без точного флоата)",
-        "m5a_midpoint_help":
-            "Впливає лише на записи якості, де НЕ задано точний флоат. ВИМК (за замовчуванням): флоат береться "
-            "як «найгірший» (найбрудніший) край перетину (якість ∩ різання) — консервативна оцінка, такий "
-            "предмет найпростіше отримати. УВІМК: флоат береться як СЕРЕДИНА перетину (якість ∩ різання) — "
-            "усереднена оцінка. На записи з уведеним точним флоатом галочка не впливає.",
-        "m5_tp_help":
-            "Коли увімкнено, поряд із кожним предметом можна ввести ціну зі Steam. Кожна ціна приводиться до "
-            "твоєї реальної валюти (через курси та бонус поповнення Steam), і для кожного предмета в ранжуванні "
-            "береться ДЕШЕВША з ціни зовнішнього маркету та ціни Steam. Вимк: лише зовнішні ціни, одна валюта.",
-        "Account for Steam (TP) prices":
-            "Облік цін Steam (ТП)",
-        "Steam (TP) pricing settings":
-            "Налаштування цін Steam (ТП)",
-        "External sites currency":
-            "Валюта зовнішніх майданчиків",
-        "Steam currency":
-            "Валюта Steam",
-        "Real currency (you pay in)":
-            "Реальна валюта (якою платиш)",
-        "Steam top-up bonus %":
-            "Бонус поповнення Steam, %",
-        "Prices are converted to your real currency; for each item the CHEAPER of market vs Steam is used.":
-            "Ціни приводяться до реальної валюти; для кожного предмета береться ДЕШЕВША з маркету та Steam.",
-        "Steam price":
-            "Ціна Steam",
-        "price from Steam":
-            "ціна зі Steam",
-        "price from market":
-            "ціна із зовнішнього маркету",
-        'Skins in this rarity':
-            'Скінів у цій рідкості',
-        'Skin':
-            'Скін',
-        'Skin name (optional)':
-            "Назва скіна (необов'язково)",
-        'Float cap min':
-            'Різання флоата, min',
-        'Float cap max':
-            'Різання флоата, max',
-        'Invalid cap: need 0 ≤ min < max ≤ 1.':
-            'Некоректне різання: потрібно 0 ≤ min < max ≤ 1.',
-        'Quality records':
-            'Записів якості',
-        'Quality (wear)':
-            'Якість (знос)',
-        'Exact float':
-            'Точний флоат',
-        'Float value':
-            'Значення флоата',
-        'contract float':
-            'контрактний флоат',
-        'float-value':
-            'вартість за флоат',
-        'Auto (cheapest by price)':
-            'Авто (найдешевша за ціною)',
-        'Record':
-            'Запис',
-        'Record used in the rarity aggregate':
-            'Запис для агрегату рідкості',
-        'Add at least two rarities, each with a valid priced skin, to compare.':
-            'Додай щонайменше дві рідкості з валідним скіном із ціною для порівняння.',
-        'Ranking with float economics (higher = better buy)':
-            'Ранжування з урахуванням економіки флоата (вище = вигідніше)',
-        'Float bonus':
-            'Флоат-бонус',
-        'Trade-up & float details':
-            'Контракти та деталі флоата',
-        'craft up':
-            'крафт вгору',
-        "News":
-            "Новини",
-        "Show all news":
-            "Показати всі новини",
-        "m5a_cands_title":
-            "Кандидати-філери: що купувати ({n})",
-        "m5a_cands_hint_cheapest":
-            "Відсортовано за ціною — спочатку найдешевші. Контракт бере верхній рядок (✅). "
-            "Кожен рядок = контракт із 10 копій саме цього запису. Повернення = вихід ÷ вхід: "
-            "100% = вкладене повернулося (у нуль), 105% = +5% прибутку, нижче 100% = збиток.",
-        "m5a_cands_hint_best":
-            "Відсортовано за поверненням — спочатку найкраще співвідношення ціна/якість. Контракт бере "
-            "верхній рядок (✅). Кожен рядок = контракт із 10 копій цього скіна в цій якості. "
-            "Повернення = вихід ÷ вхід: 100% = у нуль, 105% = +5% прибутку, нижче 100% = збиток.",
-        "m5a_col_skin":
-            "Скін",
-        "m5a_col_wear":
-            "Якість",
-        "m5a_col_float":
-            "Флоат",
-        "m5a_col_cost":
-            "Вхід ×10",
-        "m5a_col_eout":
-            "Сер. вихід",
-        "Collection template":
-            "Шаблон колекції",
-        "Load template":
-            "Завантажити шаблон",
-        "m5a_tpl_caption":
-            "Завантаження заповнює всі поля цієї колекції (усе редаговане). Воно ПЕРЕЗАПИСУЄ "
-            "поточний ввід просунутого режиму. Ціни — орієнтовні стартові "
-            "значення (USD); перед використанням онови їх під поточний ринок.",
-        "m5a_tpl_loaded_msg":
-            "Завантажено шаблон: {name} · онови ціни під поточний ринок.",
-        "m5a_craft_line":
-            "(філер: {skin} · {wear} · флоат {f}, w={w} · {price} ×{n} = {cost} → "
-            "сер. вихід {eout} · повернення {roi}% (прибуток {profit}%))",
-        "m5a_col_roi":
-            "Повернення (ROI)",
-        "m5a_cmode_label":
-            "Розрахунок контрактів (філери)",
-        "m5a_cmode_cheapest":
-            "За найдешевшими — контракт із найдешевшого запису з його реальним флоатом",
-        "m5a_cmode_best":
-            "За найкращим співвідношенням ціна/якість — перебираються всі записи, береться філер із найкращим ROI",
-        "m5a_cmode_help":
-            "Обидва режими рахують контракт на твоїх РЕАЛЬНИХ записах (10 копій одного філера). "
-            "Очікуваний вихід — середнє за ВСІМА скінами наступної рідкості, кожен оцінений на "
-            "флоаті, який дасть контракт від реального флоата філера (1 скін = 1 результат). "
-            "«За найдешевшими» відповідає: що дає класичний крафт із найдешевших філерів? "
-            "«За найкращим співвідношенням» додатково пробує кожен уведений запис як філер "
-            "і бере запис із найкращим поверненням — найкращий варіант для крафта-закупівлі. Повернення = "
-            "вихід ÷ вхід (100% = у нуль, 105% = +5% прибутку).",
-        'clean pays off — worth buying low-float fillers':
-            'чистота окупається — є сенс брати низькофлоатні філери',
-        "don't overpay for clean — a dirty filler gives the same output":
-            'не переплачуй за чистоту — брудний філер дає той самий вихід',
-        'trade-up into the next rarity is unprofitable':
-            'контракт у наступну рідкість невигідний',
-        'MODE5_ADV_NOTE':
-            'Просунутий режим: ціна рідкості для рангу — її НАЙДЕШЕВШИЙ запис (ціна філерів). Флоат-цінність — це націнка за чистоту ВСЕРЕДИНІ скіна: підлога = найдешевший запис скіна, і для запису чистішого підлоги націнка = (ціна − ціна підлоги)/(чистота − чистота підлоги) = $ за дод. одиницю чистоти (потрібно ≥2 флоата; нижче = дешевша чистота = менша переплата). Один запис → н/д. Флоат-бонус береться з ROI контракту в наступну рідкість (10→1), порахованого на РЕАЛЬНИХ записах за обраним режимом: «за найдешевшими» — найдешевший запис із його реальним флоатом, «за найкращим співвідношенням ціна/якість» — перебираються всі записи й береться філер із найкращим поверненням; вихід усереднюється за ВСІМА скінами наступної рідкості на отриманому флоаті. Повернення показується як вихід ÷ вхід (100% = у нуль, 105% = +5% прибутку); ранговий бонус дається лише вище 100%. Контрактна вага флоата w = (флоат − cap_min)/(cap_max − cap_min). У просунутому режимі галочки «красиве/ліквідне» немає — її роль виконує флоат-бонус із контрактного ROI (опис галочки вище стосується простого режиму).',
-        "Enter the price you consider fair for each rarity. Tick the box if you "
-        "find that rarity's skins beautiful or especially liquid.":
-            "Вкажи ціну, яку вважаєш справедливою для кожної якості. Постав галочку, "
-            "якщо скіни цієї якості гарні або особливо ліквідні.",
-        "Beautiful / liquid?": "Гарне / ліквідне?",
-        "rk_top_note": "(Найвища якість: її не можна скрафтити вище, а пропозиція лише "
-                       "зростає, тому до рангу застосовано штраф.)",
-        "MODE5_FORMULAS":
-            "Для кожної якості, крім найвищої, співвідношення = **ціна якості вище / ціна цієї "
-            "якості** — скільки штук цієї якості за ціною дорівнюють одному предмету якості вище. "
-            "Контракт перетворює 10 предметів однієї якості на 1 предмет наступної, тому "
-            "**більше співвідношення** означає, що якість дешева відносно того, чим стає "
-            "→ вигідніше купувати:\n\n"
-            "- ≤ 2 → **F** (сильно переоцінено)\n"
-            "- 2–3.5 → **E** (переоцінено)\n"
-            "- 3.5–4.5 → **D** (нижче середнього)\n"
-            "- 4.5–5.5 → **C** (середнє)\n"
-            "- 5.5–6.5 → **B**\n"
-            "- 6.5–8 → **A** (ця якість недооцінена)\n"
-            "- 8–10 → **A+**\n"
-            "- > 10 → **A++** (незвично — 10 цих крафтять 1 вище; перевір ліквідність верхньої)\n\n"
-            "**Найвища** якість рахується навпаки (вище неї нічого немає): її співвідношення до якості "
-            "нижче реверсується, потім застосовується штраф (−2, якщо потрапляє на A і вище, −1 для "
-            "B/C/D/E), бо найвищу якість не можна скрафтити далі, а її пропозиція лише зростає.\n\n"
-            "**Краса / ліквідність:** галочка додає +0.5 до співвідношення цієї якості та якості на 1 "
-            "нижче, +0.25 до якості на 2 нижче (на 3 нижче — нічого); на якість вище позначеної бонус "
-            "не впливає. Для найвищої якості бонус навпаки покращує її реверс-оцінку.\n\n"
-            "**Позиційні корективи (лише ранг):** незалежно від краси, ранг додатково зсувається за позицією "
-            "серед ВВЕДЕНИХ рідкостей — це впливає ЛИШЕ на ранг, не на показаний ratio і не на сирі цифри/"
-            "порівняння. Найнижчій +0.25; найвищій — додатковий −0.5 (понад її реверс-штраф); передостанній "
-            "−0.5, перед-передостанній −0.35, перед-перед-передостанній −0.25. У маленькій колекції одна "
-            "рідкість може бути і «найнижчою», і «k-ю згори» — зсуви тоді просто додаються.\n\n"
-            "Порожні ціни/0 пропускаються, тож колекції без деяких якостей враховуються. "
-            "Це евристика за введеними цінами, а не фінансова порада.",
-    },
-}
+def _to_float(value, default=0.0):
+    """Безопасно приводит к float (NaN/мусор -> default)."""
+    try:
+        return float(_num(value, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value, default=1):
+    """Безопасно приводит к int (NaN/мусор -> default)."""
+    try:
+        return int(float(_num(value, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_bool(value):
+    """Безопасно приводит к bool (NaN/None -> False).
+
+    Строки трактуются по смыслу: '0', 'false', 'no', 'нет', '' и подобные дают
+    False (в обычном Python bool('0') был бы True). Это защищает от случая, когда
+    в базу попала строка вместо целого 0/1 (например, после ручной правки).
+    """
+    val = _num(value, False)
+    if isinstance(val, str):
+        return val.strip().lower() not in ("0", "false", "no", "нет", "none", "")
+    return bool(val)
+
+
+def _is_blank(value):
+    """True, если значение пустое (None/NaN/пустая строка)."""
+    try:
+        if value is None or pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
 
 
 # ===========================================================================
-# МАТЕМАТИЧЕСКИЕ ФУНКЦИИ (чистые, без Streamlit — удобно тестировать)
+# МАТЕМАТИКА (чистые функции, без Streamlit)
 # ===========================================================================
 
-def calculate_real_spent(site_price, fee_percent=0.0, fixed_fee=0.0, quantity=1):
-    """Реальные затраты на покупку предмета(ов) на стороннем сайте.
+def compute_deal(steam_buy_price, quantity, deposit_profit_pct,
+                 buy_uah_per_usd, sell_uah_per_usd=None,
+                 sold=False, site_sell_price=0.0, sales_fee_pct=0.0):
+    """Экономика одной партии в ₴ и $ с РАЗДЕЛЬНЫМИ курсами покупки и продажи.
 
-    Процентная комиссия начисляется на всю сумму заказа (цена × количество),
-    фиксированная комиссия добавляется один раз за транзакцию:
+    Долларовая себестоимость берётся по курсу ПОКУПКИ (buy_uah_per_usd), а
+    выручка в ₴ — по курсу ПРОДАЖИ (sell_uah_per_usd). Это исключает «фантомную»
+    долларовую прибыль при изменении курса между покупкой и продажей.
 
-        real_spent = (site_price * quantity) * (1 + fee_percent / 100) + fixed_fee
+    Если sell_uah_per_usd не задан, для перевода выручки используется курс
+    покупки (обратная совместимость с записями, где один курс).
 
-    Аргумент fixed_fee должен быть уже приведён к валюте расчёта; конвертация
-    фиксированной комиссии из долларов выполняется в resolve_fixed_fee_in_target.
+    ROI возвращается None при нулевой себестоимости (доходность не определена).
 
-    Все числовые аргументы приводятся к неотрицательным значениям.
+    Защита от деления на ноль: нулевой/отрицательный множитель плюса -> стоимость
+    0; нулевой курс обнуляет соответствующий долларовый эквивалент, но не роняет
+    расчёт.
     """
-    site_price = max(0.0, float(site_price))
-    fee_percent = max(0.0, float(fee_percent))
-    fixed_fee = max(0.0, float(fixed_fee))
-    quantity = max(1, int(quantity))
-    base = site_price * quantity
-    return base * (1.0 + fee_percent / 100.0) + fixed_fee
+    steam_buy_price = max(0.0, _to_float(steam_buy_price))
+    quantity = max(1, _to_int(quantity))
+    deposit_profit_pct = _to_float(deposit_profit_pct)
+    buy_rate = max(0.0, _to_float(buy_uah_per_usd))
+    sell_rate = buy_rate if sell_uah_per_usd is None else max(0.0, _to_float(sell_uah_per_usd))
+    site_sell_price = max(0.0, _to_float(site_sell_price))
+    sales_fee_pct = min(100.0, max(0.0, _to_float(sales_fee_pct)))
+
+    growth = 1.0 + deposit_profit_pct / 100.0
+    real_cost_uah = (steam_buy_price * quantity) / growth if growth > 0 else 0.0
+    # Долларовая себестоимость — ПО КУРСУ ПОКУПКИ (фиксируется в момент покупки).
+    real_cost_usd = real_cost_uah / buy_rate if buy_rate > 0 else 0.0
+
+    result = {
+        "real_cost_uah": real_cost_uah, "real_cost_usd": real_cost_usd,
+        "revenue_usd": 0.0, "revenue_uah": 0.0,
+        "profit_uah": 0.0, "profit_usd": 0.0, "roi_pct": None,
+    }
+    if sold:
+        gross_usd = site_sell_price * quantity
+        revenue_usd = gross_usd * (1.0 - sales_fee_pct / 100.0)
+        # Выручка в ₴ — ПО КУРСУ ПРОДАЖИ.
+        revenue_uah = revenue_usd * sell_rate
+        profit_usd = revenue_usd - real_cost_usd
+        profit_uah = revenue_uah - real_cost_uah
+        roi_pct = (profit_uah / real_cost_uah * 100.0) if real_cost_uah > 0 else None
+        result.update(revenue_usd=revenue_usd, revenue_uah=revenue_uah,
+                      profit_usd=profit_usd, profit_uah=profit_uah, roi_pct=roi_pct)
+    return result
 
 
-def _split_total_fee(total_fee_percent):
-    """Делит общий процент комиссии Steam на издательскую и площадочную части.
+def holding_days(buy_iso, sell_iso):
+    """Срок удержания в днях: от покупки до продажи (или до сегодня).
 
-    Steam удерживает две отдельные комиссии: издательскую (для CS2 — 10%) и
-    комиссию площадки (5%), в сумме 15%. Поле «комиссия %» в интерфейсе задаёт
-    суммарный процент; здесь он распределяется пропорционально структуре 10:5,
-    поэтому значение по умолчанию 15% даёт ровно (10.0, 5.0).
-
-    Возвращает (cs2_fee_pct, steam_fee_pct).
+    Возвращает None, если:
+        * не задана дата покупки;
+        * дата продажи указана, но не распознаётся (кривой ввод) — чтобы мусор не
+          маскировался под «сегодня» и не давал обманчивое число дней;
+        * дата продажи раньше даты покупки (противоречие).
+    Если дата продажи просто пустая (открытая позиция), срок считается до сегодня.
+    Противоречивые/кривые даты дополнительно отмечает validate_deals.
     """
-    total = max(0.0, float(total_fee_percent))
-    default_total = STEAM_CS2_FEE_PERCENT + STEAM_STEAM_FEE_PERCENT
-    if default_total <= 0:
-        return 0.0, 0.0
-    cs2 = total * (STEAM_CS2_FEE_PERCENT / default_total)
-    steam = total * (STEAM_STEAM_FEE_PERCENT / default_total)
-    return cs2, steam
-
-
-def round_half_up_int(value):
-    """Округление цены к ближайшему целому по правилу «half up» (0.5 -> 1).
-
-    Встроенная функция round() в Python использует банковское округление
-    (round half to even): round(14.5) == 14, round(15.5) == 16. Решатель цен
-    в calculate_exact_steam_revenue нормализует ввод как int(price + 0.5), то
-    есть «арифметическим» округлением вверх на .5. Эта функция повторяет ту же
-    логику, чтобы интерфейс и расчёт не расходились на 1 единицу для
-    целочисленных валют (например, при вводе 14.5 или 16.5 с шагом 0.5).
-
-    Цены всегда неотрицательны (min_value=0.0 во всех полях), поэтому простого
-    int(value + 0.5) достаточно; на всякий случай вход приводится к >= 0.
-    """
-    return int(max(0.0, float(value)) + 0.5)
-
-
-def calculate_exact_steam_revenue(steam_buyer_price, is_integer_currency,
-                                  cs2_fee_pct=STEAM_CS2_FEE_PERCENT,
-                                  steam_fee_pct=STEAM_STEAM_FEE_PERCENT):
-    """Точная модель комиссий Steam: из цены покупателя — выручка продавца.
-
-    Для ЦЕЛОЧИСЛЕННЫХ валют (грн, ¥, ₩, CLP, IDR) модель выверена по реальным
-    данным Торговой площадки Steam. Комиссия считается от суммы продавца, каждая
-    часть округляется к БЛИЖАЙШЕМУ (round half up) с минимумом в одну единицу:
-
-        fee_cs    = max(1, round(seller * cs2_fee_pct   / 100))
-        fee_steam = max(1, round(seller * steam_fee_pct / 100))
-        buyer     = seller + fee_cs + fee_steam
-
-    Сумма продавца для запрошенной цены — это МАКСИМАЛЬНЫЙ seller, при котором
-    итоговая цена покупателя не превышает запрошенную. Если ровно такая цена
-    недостижима (на площадке лот можно выставить только за достижимую цену),
-    берётся ближайшая меньшая достижимая.
-
-    Единица расчёта зависит от валюты:
-        * целочисленные валюты — целые единицы;
-        * остальные (USD, EUR, RUB, …) — центы/копейки (цена × 100, затем / 100).
-
-    Возвращает кортеж в ИСХОДНОМ масштабе валюты:
-        (seller_revenue, valid_buyer_price, fee_cs, fee_steam).
-    Для цены меньше одной минимальной единицы — нули.
-
-    Деление на ноль исключено: масштаб равен 1 или 100, а делитель оценки
-    защищён проверкой суммарного процента.
-    """
-    price = max(0.0, float(steam_buyer_price))
-    scale = 1 if is_integer_currency else 100
-    # Перевод цены покупателя в целые единицы/центы (округление ввода к ближайшему).
-    desired = int(price * scale + 0.5)
-    if desired < 1:
-        return 0.0, 0.0, 0.0, 0.0
-
-    cs2_fee_pct = max(0.0, float(cs2_fee_pct))
-    steam_fee_pct = max(0.0, float(steam_fee_pct))
-
-    def _fees(seller_units):
-        """Комиссии Steam в наименьшей единице валюты.
-
-        Для ЦЕЛОЧИСЛЕННЫХ валют (грн, ¥, ₩ и т.п.) комиссия считается от суммы
-        продавца с округлением каждой части к БЛИЖАЙШЕМУ (round half up) и
-        минимумом в одну единицу — это поведение Valve, выверенное по реальным
-        данным Торговой площадки. Для дробных валют (центы) сохраняется прежний
-        расчёт через отбрасывание дробной части (floor) в наименьшей единице.
-
-        Исключение: если соответствующий процент комиссии равен ровно 0, то и
-        удержание равно 0 (минимум в 1 единицу применяется только к реальной,
-        ненулевой комиссии — у Steam она всегда 10% + 5%).
-        """
-        if is_integer_currency:
-            fc = 0 if cs2_fee_pct == 0 else max(1, int(seller_units * cs2_fee_pct / 100.0 + 0.5))
-            fs = 0 if steam_fee_pct == 0 else max(1, int(seller_units * steam_fee_pct / 100.0 + 0.5))
-        else:
-            fc = 0 if cs2_fee_pct == 0 else max(1, int(seller_units * cs2_fee_pct / 100.0 + 1e-9))
-            fs = 0 if steam_fee_pct == 0 else max(1, int(seller_units * steam_fee_pct / 100.0 + 1e-9))
-        return fc, fs
-
-    total_pct = cs2_fee_pct + steam_fee_pct
-    growth = 1.0 + total_pct / 100.0
-    estimate = int(desired / growth + 0.5) if growth > 0 else desired
-
-    # Сумма продавца = МАКСИМАЛЬНЫЙ seller, при котором цена покупателя
-    # (seller + комиссии) не превышает запрошенную цену. Если ровно эта цена
-    # недостижима, берётся ближайшая меньшая достижимая (как на самой площадке:
-    # выставить лот можно только за достижимую цену).
-    best_seller = 0
-    best_buyer = 0
-    best_fc = 0
-    best_fs = 0
-    for seller in range(max(1, estimate - 8), estimate + 9):
-        fc, fs = _fees(seller)
-        buyer = seller + fc + fs
-        if buyer <= desired and seller > best_seller:
-            best_seller, best_buyer, best_fc, best_fs = seller, buyer, fc, fs
-
-    if best_seller == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    return (best_seller / scale, best_buyer / scale,
-            best_fc / scale, best_fs / scale)
-
-
-def calculate_steam_received(steam_price, steam_fee_percent=DEFAULT_STEAM_FEE_PERCENT):
-    """Выручка продавца на Steam для валют с дробной частью (в центах/копейках).
-
-    Тонкая обёртка над calculate_exact_steam_revenue: суммарный процент делится
-    на издательскую и площадочную части, расчёт ведётся в центах по точной
-    модели Steam (floor с минимумом в одну единицу), что устойчивее простого
-    деления цены на коэффициент.
-
-    Пример: при комиссии 15% цена покупателя 3299.00 даёт продавцу 2868.70
-    (удержано 286.87 + 143.43).
-    """
-    cs2_fee_pct, steam_fee_pct = _split_total_fee(steam_fee_percent)
-    seller_revenue, _, _, _ = calculate_exact_steam_revenue(
-        steam_price, is_integer_currency=False,
-        cs2_fee_pct=cs2_fee_pct, steam_fee_pct=steam_fee_pct)
-    return seller_revenue
-
-
-def calculate_profit(real_spent, steam_received):
-    """Чистый плюс и процент плюса.
-
-    Возвращает (profit_amount, profit_percent).
-        profit_amount  = steam_received - real_spent
-        profit_percent = (profit_amount / real_spent) * 100
-
-    Защита от деления на ноль: при нулевых затратах процент = 0.
-    """
-    profit_amount = float(steam_received) - float(real_spent)
-    profit_percent = (profit_amount / real_spent) * 100.0 if real_spent > 0 else 0.0
-    return profit_amount, profit_percent
-
-
-def calculate_profit_cross_currency(site_real_cost, steam_received,
-                                    rate_site_to_spent, rate_steam_to_spent):
-    """Профит в продвинутом мультивалютном режиме.
-
-    Приводит затраты на сайте и выручку Steam к ВАЛЮТЕ ЗАТРАТ (базовая валюта),
-    после чего считает плюс уже в ней.
-
-        rate_site_to_spent  — сколько единиц валюты затрат в 1 единице валюты сайта;
-        rate_steam_to_spent — сколько единиц валюты затрат в 1 единице валюты Steam.
-
-    Возвращает (real_spent_base, steam_received_base, profit_amount, profit_percent).
-    """
-    real_spent_base = max(0.0, float(site_real_cost)) * max(0.0, float(rate_site_to_spent))
-    steam_received_base = max(0.0, float(steam_received)) * max(0.0, float(rate_steam_to_spent))
-    profit_amount, profit_percent = calculate_profit(real_spent_base, steam_received_base)
-    return real_spent_base, steam_received_base, profit_amount, profit_percent
-
-
-def calculate_steam_real_cost(steam_price, deposit_profit_percent):
-    """Реальная стоимость покупки скина(ов) в Steam с учётом плюса пополнения (Режим 2).
-
-        real_cost = steam_price / (1 + deposit_profit_percent / 100)
-
-    Пример: при плюсе 50% скин за 15 на ТП стоит 15 / 1.5 = 10 реальных денег.
-    (steam_price может быть уже умножена на количество — функция этого не знает.)
-
-    Защита: при делителе <= 0 (плюс -100% и ниже — полная потеря пополнения)
-    возвращается 0.0 как безопасный fallback. В интерфейсе такой ввод недостижим
-    (минимум -99.9%), поэтому ветка служит лишь страховкой от деления на ноль.
-    """
-    steam_price = max(0.0, float(steam_price))
-    divisor = 1.0 + (float(deposit_profit_percent) / 100.0)
-    # Защита от деления на ноль: при -100% (и ниже) делитель <= 0 — возвращаем 0.
-    if divisor <= 0:
-        return 0.0
-    return steam_price / divisor
-
-
-def effective_real_value(site_price, steam_price, rate_site_to_real,
-                         rate_steam_to_real, topup_pct):
-    """Эффективная стоимость предмета в РЕАЛЬНОЙ валюте — дешевле из внешней и Steam.
-
-    Внешняя -> реальная: site_price × rate_site_to_real (внешние цены уже в реальных
-    деньгах; курс лишь приводит к реальной валюте). Steam -> реальная:
-    (steam_price / (1 + topup%/100)) × rate_steam_to_real (учёт бонуса пополнения).
-    Если задана только одна цена — берётся она; если обе — берётся ДЕШЕВЛЕ.
-    Возвращает (value, source): source ∈ {'market', 'steam', None}; None — ни одной
-    цены (предмет исключается). Курсы/деления защищены от мусора.
-    """
-    site_real = None
-    if site_price and float(site_price) > 0:
-        site_real = float(site_price) * max(0.0, float(rate_site_to_real))
-    steam_real = None
-    if steam_price and float(steam_price) > 0:
-        sr = calculate_steam_real_cost(steam_price, topup_pct) * max(0.0, float(rate_steam_to_real))
-        # Отбрасываем вырожденный ноль (бонус <= -100%% — срабатывает защита деления
-        # в calculate_steam_real_cost — или курс 0): такой Steam-вариант недоступен,
-        # поэтому берём внешнюю цену, а не «бесплатный» Steam.
-        if sr > 0:
-            steam_real = sr
-    if site_real is None and steam_real is None:
-        return 0.0, None
-    if steam_real is None:
-        return site_real, "market"
-    if site_real is None:
-        return steam_real, "steam"
-    return (steam_real, "steam") if steam_real < site_real else (site_real, "market")
-
-
-def compare_purchase_options(site_real_cost, steam_real_cost):
-    """Сравнение реальных затрат двух вариантов покупки (Режим 2).
-
-    Возвращает словарь: recommendation ('steam'|'site'|'equal'),
-    savings (абсолютная экономия) и обе исходные цены.
-    """
-    difference = abs(float(site_real_cost) - float(steam_real_cost))
-    if steam_real_cost < site_real_cost:
-        recommendation = "steam"
-    elif site_real_cost < steam_real_cost:
-        recommendation = "site"
+    buy = _parse_iso(buy_iso)
+    if buy is None:
+        return None
+    # Пустая дата продажи -> открытая позиция (до сегодня). Непустая, но
+    # нераспознанная -> None (а не молчаливое «сегодня»).
+    if _is_blank(sell_iso):
+        end = date.today()
     else:
-        recommendation = "equal"
-    return {
-        "recommendation": recommendation,
-        "savings": difference,
-        "site_real_cost": site_real_cost,
-        "steam_real_cost": steam_real_cost,
-    }
-
-
-def calculate_cashout(steam_price, site_sell_price, quantity=1,
-                      sales_fee_percent=0.0, withdrawal_fee_percent=0.0,
-                      withdrawal_fixed_fee=0.0):
-    """Вывод баланса Steam в реальные деньги через продажу предмета на сайте.
-
-    Модель денежного потока (все суммы — в одной валюте; конвертация, если
-    нужна, выполняется вызывающим кодом до и после этой функции):
-
-        steam_spent       = steam_price * quantity            # списано с баланса Steam
-        gross_revenue     = site_sell_price * quantity        # цена выставления на сайте
-        after_sales_fee   = gross_revenue * (1 - sales_fee% / 100)
-        real_received     = after_sales_fee * (1 - withdrawal_fee% / 100)
-                            - withdrawal_fixed_fee             # минус фикса за вывод
-
-    Аргумент withdrawal_fixed_fee должен быть уже приведён к валюте сайта.
-    Отрицательная чистая выручка обнуляется (вывести меньше нуля нельзя).
-
-    Возвращает словарь:
-        steam_spent    — затраты баланса Steam;
-        gross_revenue  — выручка до комиссий;
-        after_sales    — выручка после комиссии за продажу;
-        real_received  — сумма к получению на карту/крипту;
-        net_profit     — real_received - steam_spent (обычно отрицательна);
-        ratio_percent  — (real_received / steam_spent) * 100; 0 при нулевых затратах.
-
-    Все числовые аргументы приводятся к неотрицательным значениям; проценты
-    выше 100 дают нулевую (а не отрицательную) выручку на соответствующем шаге.
-    """
-    steam_price = max(0.0, float(steam_price))
-    site_sell_price = max(0.0, float(site_sell_price))
-    quantity = max(1, int(quantity))
-    sales_fee_percent = max(0.0, float(sales_fee_percent))
-    withdrawal_fee_percent = max(0.0, float(withdrawal_fee_percent))
-    withdrawal_fixed_fee = max(0.0, float(withdrawal_fixed_fee))
-
-    steam_spent = steam_price * quantity
-    gross_revenue = site_sell_price * quantity
-    after_sales = gross_revenue * max(0.0, 1.0 - sales_fee_percent / 100.0)
-    real_received = after_sales * max(0.0, 1.0 - withdrawal_fee_percent / 100.0)
-    real_received = max(0.0, real_received - withdrawal_fixed_fee)
-
-    net_profit = real_received - steam_spent
-    ratio_percent = (real_received / steam_spent) * 100.0 if steam_spent > 0 else 0.0
-
-    return {
-        "steam_spent": steam_spent,
-        "gross_revenue": gross_revenue,
-        "after_sales": after_sales,
-        "real_received": real_received,
-        "net_profit": net_profit,
-        "ratio_percent": ratio_percent,
-    }
-
-
-def get_valid_steam_price(desired_buyer_price,
-                          cs2_fee_pct=STEAM_CS2_FEE_PERCENT,
-                          steam_fee_pct=STEAM_STEAM_FEE_PERCENT):
-    """Ближайшая достижимая цена покупателя для целочисленных валют (например, ₴).
-
-    Тонкая обёртка над calculate_exact_steam_revenue для валют без дробной части.
-    Возвращает кортеж (buyer_pays, seller_receive) целыми числами; для цены
-    меньше одной единицы — (0, 0).
-    """
-    seller, buyer, _, _ = calculate_exact_steam_revenue(
-        desired_buyer_price, is_integer_currency=True,
-        cs2_fee_pct=cs2_fee_pct, steam_fee_pct=steam_fee_pct)
-    return int(round(buyer)), int(round(seller))
-
-
-def _esc(text):
-    """Экранирование пользовательского текста перед вставкой в HTML.
-
-    Имена скинов вводит пользователь, а таблицы/детали рендерятся с
-    unsafe_allow_html=True — без экранирования имя вида '<img src=x onerror=...>'
-    исполнилось бы как разметка/скрипт. Здесь всё превращается в безопасный текст.
-    """
-    return html.escape(str(text), quote=True)
-
-
-def is_integer_currency(code):
-    """True, если валюта считается без дробной части (см. INTEGER_CURRENCIES)."""
-    if code is None:
-        return False
-    token = str(code).strip().lower()
-    known = {c.lower() for c in INTEGER_CURRENCIES} | _INTEGER_CURRENCY_ALIASES
-    return token in known
-
-
-def is_usd_currency(code):
-    """True, если валюта (символ/код) означает доллар США."""
-    if code is None:
-        return False
-    return str(code).strip().lower() in USD_CODES
+        end = _parse_iso(sell_iso)
+        if end is None:
+            return None
+    days = (end - buy).days
+    return days if days >= 0 else None
 
 
 # ===========================================================================
-# ВСПОМОГАТЕЛЬНЫЕ UI-ФУНКЦИИ
+# ДАТЫ (ISO-строки в базе <-> date в интерфейсе)
 # ===========================================================================
 
-def format_currency(value, currency=DEFAULT_CURRENCY, decimals=2):
-    """Форматирует число как денежную сумму: '1 234.56 $' или '16 ₴' (decimals=0)."""
-    return f"{value:,.{decimals}f} {currency}"
+def _parse_iso(value):
+    """ISO-строку / date / Timestamp -> date или None."""
+    if value is None or value == "" or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    try:
+        if isinstance(value, pd.Timestamp):
+            return value.date()
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
 
 
-def default_usd_rate(currency_symbol):
-    """Грубое значение по умолчанию «сколько валюты за 1 USD» (редактируемое)."""
-    return USD_RATE_DEFAULTS.get(currency_symbol, 1.0)
+def _to_iso(value):
+    """date / Timestamp / строку -> ISO-строка 'YYYY-MM-DD' или ''."""
+    d = _parse_iso(value)
+    return d.isoformat() if d else ""
 
 
-def render_fee_template_controls(key_prefix):
-    """Селектор профиля комиссии и флажок учёта комиссии.
+# ===========================================================================
+# БАЗА ДАННЫХ (SQLite): стабильные id, точечные правки, авто-миграция
+# ===========================================================================
 
-    Размещается вне st.form, чтобы смена профиля немедленно перерисовывала
-    зависимые поля ввода. Возвращает (template_name, enable_fees).
+def get_conn():
+    import sqlite3
+    return sqlite3.connect(DB_PATH)
+
+
+def _table_columns(conn):
+    return [r[1] for r in conn.execute("PRAGMA table_info(deals)").fetchall()]
+
+
+def init_db():
+    """Создаёт таблицу, если её нет, и при необходимости мигрирует схему.
+
+    Миграция: если в существующей базе есть только старый столбец uah_per_usd,
+    добавляются buy_uah_per_usd и sell_uah_per_usd, и старое значение курса
+    копируется в оба — исторические записи остаются корректными.
     """
-    template_name = st.selectbox(
-        _("Fee template"),
-        options=list(DEPOSIT_FEE_TEMPLATES.keys()),
-        format_func=_,  # переводит только "Manual input"; бренды — как есть
-        key=f"{key_prefix}_template",
-        help=_("Presets for popular sites. Manual input is also available."),
-    )
-    template = DEPOSIT_FEE_TEMPLATES[template_name]
-    enable_fees = st.checkbox(
-        _("Account for top-up fee"),
-        value=template.get("enabled", False),
-        key=f"{key_prefix}_enable",
-    )
-    return template_name, enable_fees
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deals (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name           TEXT    NOT NULL DEFAULT '',
+                buy_date            TEXT    NOT NULL DEFAULT '',
+                steam_buy_price     REAL    NOT NULL DEFAULT 0,
+                quantity            INTEGER NOT NULL DEFAULT 1,
+                deposit_profit_pct  REAL    NOT NULL DEFAULT 0,
+                buy_uah_per_usd     REAL    NOT NULL DEFAULT 0,
+                sold                INTEGER NOT NULL DEFAULT 0,
+                sell_date           TEXT    NOT NULL DEFAULT '',
+                site_sell_price     REAL    NOT NULL DEFAULT 0,
+                sales_fee_pct       REAL    NOT NULL DEFAULT 0,
+                sell_uah_per_usd    REAL    NOT NULL DEFAULT 0,
+                lot_group           TEXT    NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.commit()
+
+        cols = _table_columns(conn)
+        # Миграция со старой схемы (один курс uah_per_usd).
+        if "buy_uah_per_usd" not in cols:
+            conn.execute("ALTER TABLE deals ADD COLUMN buy_uah_per_usd REAL NOT NULL DEFAULT 0")
+        if "sell_uah_per_usd" not in cols:
+            conn.execute("ALTER TABLE deals ADD COLUMN sell_uah_per_usd REAL NOT NULL DEFAULT 0")
+        if "lot_group" not in cols:
+            conn.execute("ALTER TABLE deals ADD COLUMN lot_group TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+            # Старым записям назначаем группу = собственный id (каждая отдельно).
+            conn.execute("UPDATE deals SET lot_group = 'id:' || id WHERE lot_group = ''")
+        conn.commit()
+        cols = _table_columns(conn)
+        if "uah_per_usd" in cols:
+            # Переносим старый единый курс в оба новых поля там, где они ещё пустые.
+            conn.execute(
+                "UPDATE deals SET buy_uah_per_usd = uah_per_usd "
+                "WHERE (buy_uah_per_usd IS NULL OR buy_uah_per_usd = 0) AND uah_per_usd > 0"
+            )
+            conn.execute(
+                "UPDATE deals SET sell_uah_per_usd = uah_per_usd "
+                "WHERE (sell_uah_per_usd IS NULL OR sell_uah_per_usd = 0) AND uah_per_usd > 0"
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
 
-def render_fee_value_inputs(key_prefix, template_name, enable_fees):
-    """Поля процентной и фиксированной (USD) комиссии внутри st.form.
+# ===========================================================================
+# РЕЗЕРВНЫЕ КОПИИ (консистентный снимок через sqlite backup API + ротация)
+# ===========================================================================
 
-    Ключи виджетов содержат имя профиля (template_name): при смене профиля
-    Streamlit создаёт новые виджеты и сразу подставляет их значения по
-    умолчанию. Без этого приёма значения обновлялись бы только при повторном
-    взаимодействии с виджетом.
+def _daily_backup_path(day):
+    """Путь к АВТОМАТИЧЕСКОМУ ежедневному бэкапу за дату: deals.db.YYYY-MM-DD.bak."""
+    return BACKUP_DIR / f"{BACKUP_PREFIX}{day.isoformat()}{BACKUP_SUFFIX}"
 
-    Возвращает (fee_percent, fixed_fee_usd).
+
+def _manual_backup_path(moment):
+    """Путь к РУЧНОМУ бэкапу с точностью до секунды.
+
+    Содержит время (deals.db.YYYY-MM-DD_HH-MM-SS.bak), поэтому ручной бэкап
+    никогда не перезаписывает утренний ежедневный снимок и другие ручные копии.
     """
-    template = DEPOSIT_FEE_TEMPLATES[template_name]
-    if not enable_fees:
-        return 0.0, 0.0
+    ts = moment.strftime("%Y-%m-%d_%H-%M-%S")
+    return BACKUP_DIR / f"{BACKUP_PREFIX}{ts}{BACKUP_SUFFIX}"
+
+
+def _parse_backup_name(path):
+    """Разбирает имя файла бэкапа в (core, числовой_суффикс_коллизии).
+
+    Имя: deals.db.YYYY-MM-DD[.bak] (ежедневный) или
+    deals.db.YYYY-MM-DD_HH-MM-SS[_N][.bak] (ручной, N — суффикс коллизии).
+        core    — 'YYYY-MM-DD' (ежедневный) либо 'YYYY-MM-DD_HH-MM-SS' (ручной);
+        суффикс — ДОПОЛНИТЕЛЬНЫЙ _<число> ПОСЛЕ времени (или 0).
+    Единый разбор имени, чтобы сортировка и классификация типа не разошлись.
+    """
+    stem = path.name[len(BACKUP_PREFIX):]
+    if stem.endswith(BACKUP_SUFFIX):
+        stem = stem[:-len(BACKUP_SUFFIX)]
+    core, suffix_num = stem, 0
+    if "_" in stem:
+        head, _, tail = stem.rpartition("_")
+        # Суффикс коллизии — это _<число> уже ПОСЛЕ core; core это 'YYYY-MM-DD'
+        # либо 'YYYY-MM-DD_HH-MM-SS' (0 или 1 символ '_').
+        if tail.isdigit() and head and head.count("_") in (0, 1):
+            core, suffix_num = head, int(tail)
+    return core, suffix_num
+
+
+def _backup_is_manual(path):
+    """True для РУЧНОГО бэкапа (в имени есть время), False для ежедневного (только дата)."""
+    core, _ = _parse_backup_name(path)
+    return "_" in core
+
+
+def _backup_sort_key(path):
+    """Ключ хронологической сортировки бэкапа по РАЗОБРАННОМУ имени.
+
+    Возвращает (метка_времени, числовой_суффикс): порядок совпадает с реальной
+    хронологией независимо от ширины суффикса (_2 vs _10 vs _100) — суффикс
+    сравнивается как ЧИСЛО. Ежедневный снимок (без времени) считается «началом
+    дня» (00:00:00) с суффиксом 0.
+    """
+    core, suffix_num = _parse_backup_name(path)
+    ts = core if "_" in core else core + "_00-00-00"
+    return (ts, suffix_num)
+
+
+def list_backups():
+    """Список существующих файлов бэкапов, новейшие первыми.
+
+    Сортировка — по разобранному ключу (метка времени + числовой суффикс), а не
+    по строке имени, поэтому хронология сохраняется при любом числе коллизий в
+    одну секунду (_2, _10, _100 сравниваются как числа).
+    """
+    if not BACKUP_DIR.exists():
+        return []
+    files = [p for p in BACKUP_DIR.glob(f"{BACKUP_PREFIX}*{BACKUP_SUFFIX}") if p.is_file()]
+    return sorted(files, key=_backup_sort_key, reverse=True)
+
+
+def prune_backups(keep_daily=BACKUP_KEEP_DAILY, keep_manual=BACKUP_KEEP_MANUAL):
+    """Прореживает копии РАЗДЕЛЬНО по типам.
+
+    Оставляет последние keep_daily ЕЖЕДНЕВНЫХ (авто) снимков и последние
+    keep_manual РУЧНЫХ копий, считая каждый тип в своей квоте. Поэтому всплеск
+    ручных копий (например, серия удалений за день) больше НЕ вытесняет
+    ежедневную историю, и наоборот. Сегодняшний ежедневный снимок защищён всегда.
+
+    Возвращает число удалённых файлов. Ошибки удаления отдельных файлов
+    игнорируются (бэкап не должен мешать работе приложения).
+    """
+    all_backups = list_backups()                       # новейшие первыми
+    daily = [p for p in all_backups if not _backup_is_manual(p)]
+    manual = [p for p in all_backups if _backup_is_manual(p)]
+    # Последние keep_daily ежедневных + последние keep_manual ручных (каждый тип — своя квота).
+    keep_set = set(daily[:keep_daily]) | set(manual[:keep_manual])
+    # Сегодняшний ежедневный снимок защищаем всегда (даже если квота ежедневных = 0).
+    today_daily = _daily_backup_path(date.today())
+    if today_daily.exists():
+        keep_set.add(today_daily)
+
+    removed = 0
+    for p in all_backups:
+        if p in keep_set:
+            continue
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _copy_db_to(target_path):
+    """Делает консистентный снимок базы в target_path через sqlite backup API.
+
+    Пишет во временный файл рядом и атомарно переименовывает — незавершённый
+    бэкап не оставит «битый» .bak. Возвращает True при успехе.
+    """
+    import sqlite3
+    tmp = target_path.with_suffix(BACKUP_SUFFIX + ".tmp")
+    src = sqlite3.connect(DB_PATH)
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)            # консистентный снимок даже при открытой базе
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    if tmp.stat().st_size <= 0:
+        tmp.unlink(missing_ok=True)
+        return False
+    os.replace(tmp, target_path)       # атомарная замена
+    return True
+
+
+def make_backup(force=False, manual=False):
+    """Создаёт консистентный снимок базы в BACKUP_DIR.
+
+    Два режима:
+        * АВТОМАТИЧЕСКИЙ (manual=False) — не чаще одного в сутки. Имя содержит
+          только дату; если копия за сегодня уже есть и force=False, ничего не
+          делается. Утренний снимок «как было на начало дня».
+        * РУЧНОЙ (manual=True) — отдельный файл с датой-временем (до секунды).
+          Никогда не перезаписывает утренний ежедневный снимок и не теряет его,
+          даже если базу только что испортили и нажали кнопку.
+
+    После успешной копии прореживает старые: отдельно до BACKUP_KEEP_DAILY ежедневных
+    и BACKUP_KEEP_MANUAL ручных копий.
+
+    Возвращает (status, path):
+        status: 'created' | 'exists' | 'error'; path: Path или None.
+    Любая ошибка перехватывается и возвращается как 'error' — приложение
+    продолжает работать без свежего бэкапа.
+    """
+    target = None
+    try:
+        if not DB_PATH.exists():
+            return "error", None
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+        if manual:
+            target = _manual_backup_path(datetime.now())
+            # Защита от совпадения по секунде: если файл с таким именем уже есть
+            # (две копии в одну и ту же секунду), добавляем числовой суффикс,
+            # чтобы вторая копия не затёрла первую.
+            if target.exists():
+                stem = target.name[:-len(BACKUP_SUFFIX)]
+                n = 2
+                while True:
+                    # Нулевое заполнение (_02, _03 … _10, _11), чтобы лексикографи-
+                    # ческая сортировка совпадала с хронологией даже при >9 копий
+                    # в одну и ту же секунду.
+                    cand = BACKUP_DIR / f"{stem}_{n:02d}{BACKUP_SUFFIX}"
+                    if not cand.exists():
+                        target = cand
+                        break
+                    n += 1
+        else:
+            target = _daily_backup_path(date.today())
+            if target.exists() and not force:
+                return "exists", target
+
+        if not _copy_db_to(target):
+            return "error", None
+        prune_backups()
+        return "created", target
+    except Exception:
+        # Подчищаем временный файл, если он остался.
+        try:
+            if target is not None:
+                tmp_path = target.with_suffix(BACKUP_SUFFIX + ".tmp")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+        except OSError:
+            pass
+        return "error", None
+
+
+def _normalize_deal(d):
+    """Приводит словарь партии к полному набору полей с корректными типами.
+
+    Безопасное приведение (NaN/None/пустые -> значения по умолчанию).
+
+    Про курсы:
+        * курс покупки восстанавливается из старого единого ключа uah_per_usd
+          (обратная совместимость с миграцией одно-курсовой схемы);
+        * курс покупки НЕ выдумывается из курса продажи: если реальный курс
+          покупки неизвестен, он остаётся 0 (пустым), а долларовая себестоимость
+          считается неопределённой. Это честнее, чем подменять историческую
+          себестоимость курсом на момент продажи и тихо её искажать;
+        * курс продажи для ОТКРЫТОЙ партии НЕ выдумывается и остаётся 0 (пустым):
+          так его нельзя по ошибке принять за реальный курс будущей продажи. Курс
+          продажи подставляется (из курса покупки) только если партия ПРОДАНА, а
+          сам курс продажи не задан — чтобы у закрытой сделки расчёт был полным.
+    """
+    sold_flag = _to_bool(d.get("sold"))
+    buy_rate = max(0.0, _to_float(d.get("buy_uah_per_usd"), 0.0))
+    sell_rate = max(0.0, _to_float(d.get("sell_uah_per_usd"), 0.0))
+    # Обратная совместимость: старый единый ключ uah_per_usd (миграция схемы).
+    legacy = max(0.0, _to_float(d.get("uah_per_usd"), 0.0))
+    if buy_rate == 0.0 and legacy > 0:
+        buy_rate = legacy
+    if sell_rate == 0.0 and legacy > 0 and sold_flag:
+        sell_rate = legacy
+    # Курс продажи заполняем из курса покупки ТОЛЬКО для проданных партий.
+    # Обратное (курс покупки из курса продажи) НЕ делаем — см. docstring.
+    if sold_flag and sell_rate == 0.0 and buy_rate > 0:
+        sell_rate = buy_rate
+    # Для открытых партий все поля продажи очищаются: курс, дата, цена, комиссия.
+    # Иначе при снятии галочки «Продано» в журнале зависали бы «призрачные»
+    # данные продажи, и проверка постоянно ругалась бы на несоответствие.
+    if not sold_flag:
+        sell_rate = 0.0
+        sell_date_val = ""
+        site_sell_val = 0.0
+        sales_fee_val = 0.0
+    else:
+        sell_date_val = _to_iso(d.get("sell_date", ""))
+        site_sell_val = max(0.0, _to_float(d.get("site_sell_price"), 0.0))
+        sales_fee_val = max(0.0, _to_float(d.get("sales_fee_pct"), 0.0))
+    return {
+        "item_name": str(_num(d.get("item_name"), "") or "").strip(),
+        "buy_date": _to_iso(d.get("buy_date", "")),
+        "steam_buy_price": max(0.0, _to_float(d.get("steam_buy_price"), 0.0)),
+        # Количество НЕ принуждаем к 1: пустое/мусор -> 0 (через _to_int с дефолтом
+        # 0), чтобы битая запись (0 или отрицательное) сохранялась как есть и
+        # оставалась видимой ошибкой, а не подменялась молча на 1 при сохранении.
+        # validate_deals предупреждает о quantity<1, а сводка исключает такие
+        # строки из итогов. Защита от деления/умножения на мусор — в compute_deal.
+        "quantity": _to_int(d.get("quantity"), 0),
+        "deposit_profit_pct": _to_float(d.get("deposit_profit_pct"), 0.0),
+        "buy_uah_per_usd": buy_rate,
+        "sold": 1 if sold_flag else 0,
+        "sell_date": sell_date_val,
+        "site_sell_price": site_sell_val,
+        "sales_fee_pct": sales_fee_val,
+        "sell_uah_per_usd": sell_rate,
+        "lot_group": str(_num(d.get("lot_group"), "") or "").strip(),
+    }
+
+
+_INSERT_SQL = """
+    INSERT INTO deals (item_name, buy_date, steam_buy_price, quantity,
+                       deposit_profit_pct, buy_uah_per_usd, sold, sell_date,
+                       site_sell_price, sales_fee_pct, sell_uah_per_usd, lot_group)
+    VALUES (:item_name, :buy_date, :steam_buy_price, :quantity,
+            :deposit_profit_pct, :buy_uah_per_usd, :sold, :sell_date,
+            :site_sell_price, :sales_fee_pct, :sell_uah_per_usd, :lot_group)
+"""
+
+_UPDATE_SQL = """
+    UPDATE deals SET
+        item_name=:item_name, buy_date=:buy_date, steam_buy_price=:steam_buy_price,
+        quantity=:quantity, deposit_profit_pct=:deposit_profit_pct,
+        buy_uah_per_usd=:buy_uah_per_usd, sold=:sold, sell_date=:sell_date,
+        site_sell_price=:site_sell_price, sales_fee_pct=:sales_fee_pct,
+        sell_uah_per_usd=:sell_uah_per_usd, lot_group=:lot_group
+    WHERE id=:id
+"""
+
+
+def insert_deals_atomic(deals):
+    """Вставляет несколько связанных партий в ОДНОЙ транзакции.
+
+    Используется, когда покупка сразу порождает несколько партий (закрытую часть
+    и остаток): либо записываются все, либо ни одной — промежуточного состояния
+    не возникает даже при сбое. Партиям без явной группы назначается общая группа
+    по id ПЕРВОЙ вставленной партии, чтобы части одной покупки сводились в сверке.
+    Возвращает список id вставленных строк.
+    """
+    conn = get_conn()
+    try:
+        ids = []
+        first_group = None
+        for d in deals:
+            payload = _normalize_deal(d)
+            cur = conn.execute(_INSERT_SQL, payload)
+            rid = cur.lastrowid
+            ids.append(rid)
+            if first_group is None:
+                first_group = payload.get("lot_group") or f"id:{rid}"
+            if not payload.get("lot_group"):
+                conn.execute("UPDATE deals SET lot_group = ? WHERE id = ?", (first_group, rid))
+        conn.commit()
+        return ids
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def insert_deal(deal):
+    """Добавляет одну партию (атомарно). Возвращает id новой строки."""
+    conn = get_conn()
+    try:
+        payload = _normalize_deal(deal)
+        cur = conn.execute(_INSERT_SQL, payload)
+        new_id = cur.lastrowid
+        # Если группа не задана явно, делаем её равной собственному id партии.
+        if not payload.get("lot_group"):
+            conn.execute("UPDATE deals SET lot_group = ? WHERE id = ?", (f"id:{new_id}", new_id))
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def fetch_deals():
+    """Все партии списком словарей, отсортированные по дате покупки, затем id."""
+    import sqlite3
+    conn = get_conn()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM deals").fetchall()
+    finally:
+        conn.close()
+    deals = [dict(r) for r in rows]
+    deals.sort(key=lambda d: (_parse_iso(d.get("buy_date")) or date.max, d.get("id", 0)))
+    return deals
+
+
+def apply_changes(updates, inserts, delete_ids):
+    """Применяет точечные изменения в ОДНОЙ транзакции (стабильные id).
+
+        updates    — список словарей с обязательным ключом 'id' (UPDATE по id);
+        inserts    — список словарей без id (INSERT, id назначит база);
+        delete_ids — список id для удаления.
+
+    Используется для сохранения правок из таблицы: существующие строки
+    обновляются по id (id НЕ меняются), удалённые — удаляются, новые —
+    добавляются. Это не трогает id остальных строк и не «раздувает» счётчик.
+    """
+    conn = get_conn()
+    try:
+        if delete_ids:
+            conn.executemany("DELETE FROM deals WHERE id=?", [(i,) for i in delete_ids])
+        for u in updates:
+            payload = _normalize_deal(u)
+            payload["id"] = int(u["id"])
+            conn.execute(_UPDATE_SQL, payload)
+        for x in inserts:
+            payload = _normalize_deal(x)
+            cur = conn.execute(_INSERT_SQL, payload)
+            if not payload.get("lot_group"):
+                conn.execute("UPDATE deals SET lot_group = ? WHERE id = ?",
+                             (f"id:{cur.lastrowid}", cur.lastrowid))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def replace_lot_with_sale(deals, lot_id, sell_qty, sell_date_iso,
+                          site_sell_price, sales_fee_pct, sell_rate):
+    """Оформляет продажу части открытой партии через ТОЧЕЧНЫЕ правки по id.
+
+    Возвращает (updates, inserts, delete_ids) для apply_changes:
+        * исходная открытая партия превращается (UPDATE по её id) в закрытую на
+          проданное количество (курс продажи фиксируется отдельно);
+        * если остался хвост — добавляется (INSERT) новая открытая партия;
+        * если продаётся весь остаток — хвоста нет.
+    Курс покупки наследуется от исходной партии. Сумма «продано + остаток» равна
+    исходному количеству, баланс предметов сохраняется.
+    """
+    lot = next((d for d in deals if d.get("id") == lot_id and not _to_bool(d.get("sold"))), None)
+    if lot is None:
+        return [], [], []
+    open_qty = max(1, _to_int(lot.get("quantity"), 1))
+    q = max(1, min(_to_int(sell_qty, 1), open_qty))
+    remaining = open_qty - q
+    pf = {k: lot.get(k) for k in PURCHASE_FIELDS}
+    # Гарантируем общую группу для проданной части и остатка (для корректной сверки).
+    group = str(lot.get("lot_group") or "").strip() or f"id:{lot_id}"
+    pf["lot_group"] = group
+
+    sold_lot = _normalize_deal({
+        **pf, "quantity": q, "sold": 1, "sell_date": sell_date_iso,
+        "site_sell_price": site_sell_price, "sales_fee_pct": sales_fee_pct,
+        "sell_uah_per_usd": sell_rate,
+    })
+    sold_lot["id"] = lot_id  # переиспользуем существующий id (UPDATE)
+
+    inserts = []
+    if remaining > 0:
+        inserts.append(_normalize_deal({
+            **pf, "quantity": remaining, "sold": 0, "sell_date": "",
+            "site_sell_price": 0.0, "sales_fee_pct": 0.0, "sell_uah_per_usd": 0.0,
+        }))
+    return [sold_lot], inserts, []
+
+
+# ===========================================================================
+# СОПОСТАВЛЕНИЕ ПРАВОК РЕДАКТОРА С id (для точечного сохранения)
+# ===========================================================================
+
+def diff_editor_state(original_deals, editor_state):
+    """Преобразует состояние st.data_editor в (updates, inserts, delete_ids).
+
+    original_deals — список партий В ТОМ ЖЕ порядке, в каком строки поданы в
+    редактор (позиция строки = индекс в этом списке). editor_state — словарь
+    из st.session_state[key] с ключами 'edited_rows', 'added_rows',
+    'deleted_rows'. Возвращает изменения, привязанные к стабильным id.
+
+    Пустые/частично пустые добавленные строки отсекаются (нужны название или
+    положительная цена покупки).
+    """
+    edited = editor_state.get("edited_rows", {}) or {}
+    added = editor_state.get("added_rows", []) or []
+    deleted = editor_state.get("deleted_rows", []) or []
+
+    # Удаления -> id из исходного списка по позиции.
+    delete_ids = []
+    for pos in deleted:
+        if 0 <= pos < len(original_deals):
+            delete_ids.append(int(original_deals[pos]["id"]))
+
+    # Изменения существующих строк -> применяем поверх исходных значений.
+    # Если позиция выходит за пределы исходного списка (некоторые версии
+    # Streamlit так представляют ПРАВКИ только что добавленных строк), трактуем
+    # такую строку как новую вставку, а не отбрасываем её.
+    updates = []
+    edited_as_inserts = []
+    cleared_delete_ids = []
+    for pos, changes in edited.items():
+        pos = int(pos)
+        if 0 <= pos < len(original_deals):
+            base = dict(original_deals[pos])
+            base.update(changes)  # перезаписываем только изменённые поля
+            base["id"] = int(original_deals[pos]["id"])
+            # Если существующую строку полностью очистили (не осталось ни названия,
+            # ни цены, ни данных продажи, ни курса, ни отметки «Продано»), это
+            # намерение УДАЛИТЬ её, а не сохранить пустой «призрак» с количеством 1.
+            if not _meaningful_row(base):
+                cleared_delete_ids.append(int(original_deals[pos]["id"]))
+            else:
+                updates.append(base)
+        else:
+            # Правка строки за пределами исходных данных = добавленная строка.
+            if _meaningful_row(changes):
+                edited_as_inserts.append(dict(changes))
+
+    # Новые строки -> INSERT (с фильтром пустых).
+    inserts = []
+    for row in added:
+        if _meaningful_row(row):
+            inserts.append(row)
+    inserts.extend(edited_as_inserts)
+
+    # Очищенные существующие строки удаляем (без дублей с явными удалениями).
+    for did in cleared_delete_ids:
+        if did not in delete_ids:
+            delete_ids.append(did)
+
+    return updates, inserts, delete_ids
+
+
+def _meaningful_row(row):
+    """True, если в строке есть осмысленная сделка.
+
+    Строка считается заполненной, если задано НАЗВАНИЕ, либо положительная цена
+    покупки, либо есть данные продажи (дата/цена), либо проставлен любой курс.
+    Ни количество, ни одна лишь галочка «Продано» сами по себе строку осмысленной
+    не делают: это характеристики реальной сделки, а не свидетельство её наличия.
+    Поэтому пустая строка, где случайно тронули только количество или только
+    чекбокс «Продано», не превращается в фантомную сделку. «Бесплатные» дропы
+    (цена 0) при наличии названия по-прежнему сохраняются.
+    """
+    name = str(_num(row.get("item_name"), "") or "").strip()
+    price = _to_float(row.get("steam_buy_price"), 0.0)
+    has_sale = (not _is_blank(row.get("sell_date"))) or _to_float(row.get("site_sell_price"), 0.0) > 0
+    has_rate = _to_float(row.get("buy_uah_per_usd"), 0.0) > 0 or _to_float(row.get("sell_uah_per_usd"), 0.0) > 0
+    return bool(name) or price > 0 or has_sale or has_rate
+
+
+# ===========================================================================
+# ПРОВЕРКА ДАННЫХ И СВЕРКА ПО ПОКУПКАМ
+# ===========================================================================
+
+def validate_deals(deals):
+    """Список предупреждений о внутренне противоречивых записях.
+
+    Правила:
+        * партия отмечена проданной, но НЕ заполнено хотя бы одно из полей
+          (дата продажи ИЛИ цена продажи) — строгая проверка, ловит и частично
+          заполненные продажи;
+        * заполнены данные продажи, но партия не отмечена «Продано»;
+        * дата продажи раньше даты покупки;
+        * дата покупки или продажи в будущем (вероятная опечатка);
+        * партия с нулевым/пустым курсом покупки (долларовые суммы будут неверны);
+        * проданная партия без курса продажи И без курса покупки (нет даже
+          запасного курса для пересчёта выручки). Если курс покупки есть, он
+          служит запасным курсом продажи, и предупреждение не выдаётся.
+    """
+    today = date.today()
+    warnings = []
+    for d in deals:
+        name = (str(d.get("item_name") or "").strip()) or "без названия"
+        sold = _to_bool(d.get("sold"))
+        sell_date = _to_iso(d.get("sell_date"))
+        sell_price = _to_float(d.get("site_sell_price"))
+        has_any_sale = (sell_date != "") or sell_price > 0
+
+        if sold and (sell_date == "" or sell_price <= 0):
+            missing = []
+            if sell_date == "":
+                missing.append("дата продажи")
+            if sell_price <= 0:
+                missing.append("цена продажи")
+            warnings.append(f"«{name}»: отмечено как продано, но не заполнено: {', и '.join(missing)}.")
+        if (not sold) and has_any_sale:
+            warnings.append(f"«{name}»: заполнены данные продажи, но партия не отмечена как «Продано».")
+
+        bd = _parse_iso(d.get("buy_date"))
+        sd = _parse_iso(d.get("sell_date"))
+        if bd and sd and sd < bd:
+            warnings.append(f"«{name}»: дата продажи ({sd.isoformat()}) раньше даты покупки ({bd.isoformat()}).")
+        # Даты из будущего — вероятная опечатка.
+        if bd and bd > today:
+            warnings.append(f"«{name}»: дата покупки ({bd.isoformat()}) в будущем — проверь дату.")
+        if sd and sd > today:
+            warnings.append(f"«{name}»: дата продажи ({sd.isoformat()}) в будущем — проверь дату.")
+        # Нет даты покупки у ПРОДАННОЙ партии: себестоимость считается, но срок
+        # удержания (holding_days) посчитать нельзя — для завершённой сделки это важно.
+        if sold and _to_iso(d.get("buy_date")) == "":
+            warnings.append(f"«{name}»: продано, но не указана дата покупки — срок удержания не посчитать.")
+
+        buy_rate = _to_float(d.get("buy_uah_per_usd"))
+        sell_rate = _to_float(d.get("sell_uah_per_usd"))
+        if buy_rate <= 0:
+            warnings.append(f"«{name}»: не задан курс покупки (₴/$) — долларовые суммы будут некорректны.")
+        # Про курс продажи предупреждаем, только если нет и курса покупки: при
+        # наличии курса покупки он используется как запасной, и выручка считается
+        # корректно — ругаться не на что (иначе это ложный шум на старых записях).
+        if sold and sell_rate <= 0 and buy_rate <= 0:
+            warnings.append(f"«{name}»: продано, но не задан ни курс продажи, ни курс покупки (₴/$) — "
+                            "выручку в ₴ не на что пересчитать.")
+
+        # Проверки уже сохранённых «мусорных» значений (например, после ручных
+        # правок или из старой базы): количество, отрицательные суммы, проценты.
+        if _to_int(d.get("quantity"), 0) < 1:
+            warnings.append(f"«{name}»: некорректное количество (меньше 1).")
+        if _to_float(d.get("steam_buy_price")) < 0:
+            warnings.append(f"«{name}»: отрицательная цена покупки.")
+        if _to_float(d.get("site_sell_price")) < 0:
+            warnings.append(f"«{name}»: отрицательная цена продажи.")
+        fee = _to_float(d.get("sales_fee_pct"))
+        if fee < 0 or fee > 100:
+            warnings.append(f"«{name}»: комиссия продажи вне диапазона 0–100% ({fee:g}%).")
+        # Чистый плюс -100% и ниже делает множитель (1 + плюс/100) нулевым или
+        # отрицательным, и реальная стоимость обнуляется — отчёты исказятся.
+        dep = _to_float(d.get("deposit_profit_pct"))
+        if dep <= -100.0:
+            warnings.append(f"«{name}»: чистый плюс {dep:g}% (≤ −100%) обнуляет себестоимость — "
+                            "проверь значение, иначе прибыль и ROI будут неверны.")
+    return warnings
+
+
+def reconcile_purchases(deals):
+    """Группирует партии по ИСХОДНОЙ покупке и считает: продано / на руках / всего.
+
+    Партии, отколовшиеся от одной покупки через частичную продажу, имеют общий
+    идентификатор группы lot_group (если он есть в записи). Группировка идёт
+    именно по нему, поэтому:
+        * части одной покупки (одна открытая + несколько закрытых) сводятся
+          в одну строку;
+        * две НЕЗАВИСИМЫЕ покупки с одинаковыми параметрами НЕ сливаются —
+          у них разные группы.
+    Для записей без lot_group ключом группы служит собственный id партии, то есть
+    по умолчанию они не схлопываются друг с другом.
+
+    В строке показываются параметры покупки (берутся из любой партии группы;
+    у частей одной покупки они одинаковы).
+    """
+    groups = {}
+    for idx, d in enumerate(deals):
+        gid = d.get("lot_group")
+        if gid in (None, "", 0):
+            did = d.get("id")
+            # Нет группы: если есть id — ключ по нему; если id тоже нет (новая
+            # строка из редактора), даём УНИКАЛЬНЫЙ ключ по позиции, чтобы разные
+            # новые строки не схлопывались в одну (id:None).
+            gid = f"id:{did}" if did not in (None, "", 0) else f"row:{idx}"
+        g = groups.setdefault(str(gid), {
+            "sold": 0, "open": 0,
+            "name": (str(d.get("item_name") or "").strip()),
+            "buy_date": _to_iso(d.get("buy_date")),
+            "price": round(_to_float(d.get("steam_buy_price")), 2),
+            "dep": round(_to_float(d.get("deposit_profit_pct")), 2),
+            "brate": round(_to_float(d.get("buy_uah_per_usd")), 2),
+        })
+        qty = max(0, _to_int(d.get("quantity"), 0))
+        if _to_bool(d.get("sold")):
+            g["sold"] += qty
+        else:
+            g["open"] += qty
+
+    rows = []
+    for v in groups.values():
+        rows.append({
+            "Предмет": v["name"] or "—",
+            "Куплено": v["buy_date"] or "—",
+            "Цена закупки, ₴": v["price"],
+            "Чистый плюс, %": v["dep"],
+            "Курс покупки": v["brate"],
+            "Продано": v["sold"],
+            "На руках": v["open"],
+            "Всего": v["sold"] + v["open"],
+        })
+    rows.sort(key=lambda r: (r["Предмет"], r["Куплено"]))
+    return rows
+
+
+# ===========================================================================
+# ПОДГОТОВКА ДАННЫХ ДЛЯ ОТОБРАЖЕНИЯ
+# ===========================================================================
+
+def build_dataframe(deals):
+    """DataFrame: поля ввода (два курса) + рассчитанные колонки.
+
+    Сохраняет скрытый столбец _id (id партии) для точечного сохранения; он не
+    показывается в редакторе (отключён в column_order), но позволяет привязать
+    правки к стабильным id.
+    """
+    records = []
+    for d in deals:
+        sold = _to_bool(d.get("sold"))
+        # Для проданной партии без заданного курса продажи используем курс покупки
+        # (как описано в compute_deal); для открытой курс продажи не нужен (None).
+        buy_rate = _to_float(d.get("buy_uah_per_usd"))
+        sell_rate_raw = _to_float(d.get("sell_uah_per_usd"))
+        if sold:
+            sell_rate_arg = sell_rate_raw if sell_rate_raw > 0 else (buy_rate if buy_rate > 0 else None)
+        else:
+            sell_rate_arg = None
+        calc = compute_deal(
+            steam_buy_price=d.get("steam_buy_price", 0.0),
+            quantity=d.get("quantity", 1),
+            deposit_profit_pct=d.get("deposit_profit_pct", 0.0),
+            buy_uah_per_usd=d.get("buy_uah_per_usd", 0.0),
+            sell_uah_per_usd=sell_rate_arg,
+            sold=sold,
+            site_sell_price=d.get("site_sell_price", 0.0),
+            sales_fee_pct=d.get("sales_fee_pct", 0.0),
+        )
+        roi = calc["roi_pct"]
+        # Продажа считается ПОЛНОЙ, только если есть и цена, и дата продажи. Иначе
+        # (галочка «Продано» без цены/даты) прибыль в журнале НЕ показывается —
+        # чтобы число на экране не приняли за итог, который сводка всё равно не
+        # учитывает. Такая строка получает отдельный статус «Закрыта (неполная)».
+        sell_price_val = _to_float(d.get("site_sell_price"), 0.0)
+        sell_date_val = _parse_iso(d.get("sell_date"))
+        complete_sale = sold and sell_price_val > 0 and sell_date_val is not None
+        if sold and not complete_sale:
+            status = "Закрыта (неполная)"
+        elif sold:
+            status = "Закрыта"
+        else:
+            status = "Открыта"
+        # Долларовую прибыль показываем только при заданном курсе покупки: без
+        # него долларовая себестоимость = 0, и profit_usd был бы завышен (вся
+        # выручка). Гривневую прибыль показываем всегда (она от курса не зависит).
+        usd_defined = complete_sale and _to_float(d.get("buy_uah_per_usd")) > 0
+        # Некорректное количество (<1) исключаем из ВСЕХ расчётных колонок: иначе журнал
+        # показал бы себестоимость/прибыль, посчитанную по форсированному количеству 1
+        # (compute_deal), тогда как сводка такую строку исключает. Так journal и сводка
+        # согласованы — для битого количества расчёт пуст (—).
+        qty_ok = _to_int(d.get("quantity"), 0) >= 1
+        records.append({
+            "_id": d.get("id"),
+            "_lot_group": d.get("lot_group", ""),
+            "item_name": d.get("item_name", ""),
+            "buy_date": _parse_iso(d.get("buy_date")),
+            "steam_buy_price": _to_float(d.get("steam_buy_price")),
+            "quantity": _to_int(d.get("quantity"), 0),
+            "deposit_profit_pct": _to_float(d.get("deposit_profit_pct")),
+            "buy_uah_per_usd": _to_float(d.get("buy_uah_per_usd")),
+            "sold": sold,
+            "sell_date": sell_date_val,
+            "site_sell_price": sell_price_val,
+            "sales_fee_pct": _to_float(d.get("sales_fee_pct")),
+            "sell_uah_per_usd": _to_float(d.get("sell_uah_per_usd")),
+            "real_cost_uah": round(calc["real_cost_uah"], 2) if qty_ok else None,
+            "profit_uah": round(calc["profit_uah"], 2) if (complete_sale and qty_ok) else None,
+            "profit_usd": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
+            "roi_pct": round(roi, 1) if (complete_sale and roi is not None and qty_ok) else None,
+            "holding_days": holding_days(d.get("buy_date"), d.get("sell_date")),
+            "status": status,
+        })
+
+    columns = ["_id", "_lot_group"] + INPUT_COLUMNS + COMPUTED_COLUMNS
+    if not records:
+        df = pd.DataFrame({c: pd.Series(dtype="object") for c in columns})
+    else:
+        df = pd.DataFrame(records, columns=columns)
+    df["buy_date"] = pd.to_datetime(df["buy_date"], errors="coerce")
+    df["sell_date"] = pd.to_datetime(df["sell_date"], errors="coerce")
+    return df
+
+
+def column_config():
+    """Подписи, типы и форматы колонок для st.data_editor.
+
+    У всех денежных полей и курсов формат %.2f и шаг 0.01 — сотые (например курс
+    44.44) вводятся и сохраняются без округления до десятых.
+    """
+    return {
+        "item_name": st.column_config.TextColumn("Предмет", width="medium"),
+        "buy_date": st.column_config.DateColumn("Дата покупки", format="YYYY-MM-DD"),
+        "steam_buy_price": st.column_config.NumberColumn("Покупка в Steam, ₴", min_value=0.0, step=0.01, format="%.2f"),
+        "quantity": st.column_config.NumberColumn("Кол-во", min_value=1, step=1, format="%d"),
+        "deposit_profit_pct": st.column_config.NumberColumn("Чистый плюс, %", min_value=-99.9, step=0.01, format="%.2f"),
+        "buy_uah_per_usd": st.column_config.NumberColumn("Курс покупки ₴/$", min_value=0.0, step=0.01, format="%.2f"),
+        "sold": st.column_config.CheckboxColumn("Продано"),
+        "sell_date": st.column_config.DateColumn("Дата продажи", format="YYYY-MM-DD"),
+        "site_sell_price": st.column_config.NumberColumn("Продажа на сайте, $", min_value=0.0, step=0.01, format="%.2f"),
+        "sales_fee_pct": st.column_config.NumberColumn("Комиссия сайта, %", min_value=0.0, max_value=100.0, step=0.01, format="%.2f"),
+        "sell_uah_per_usd": st.column_config.NumberColumn("Курс продажи ₴/$", min_value=0.0, step=0.01, format="%.2f"),
+        "real_cost_uah": st.column_config.NumberColumn("Реальная стоимость, ₴", format="%.2f"),
+        "profit_uah": st.column_config.NumberColumn("Прибыль, ₴", format="%.2f"),
+        "profit_usd": st.column_config.NumberColumn("Прибыль, $", format="%.2f"),
+        "roi_pct": st.column_config.NumberColumn("ROI, %", format="%.1f"),
+        "holding_days": st.column_config.NumberColumn("Дней", format="%d"),
+        "status": st.column_config.TextColumn("Статус"),
+    }
+
+
+def open_lots(deals):
+    """Открытые партии (остатки на руках)."""
+    return [d for d in deals if not _to_bool(d.get("sold")) and _to_int(d.get("quantity"), 0) > 0]
+
+
+def lot_label(d):
+    """Человекочитаемая подпись партии для выпадающего списка."""
+    bdate = _to_iso(d.get("buy_date")) or "—"
+    return (f"#{d.get('id')} · {d.get('item_name') or 'без названия'} · "
+            f"{_to_int(d.get('quantity'), 0)} шт · куплено {bdate} по "
+            f"{_to_float(d.get('steam_buy_price')):.2f} ₴/шт")
+
+
+def lot_delete_label(d):
+    """Подпись партии для удаления: базовая подпись + статус (продано/остаток)."""
+    base = lot_label(d)
+    if _to_bool(d.get("sold")):
+        sdate = _to_iso(d.get("sell_date")) or "—"
+        return base + f" · ПРОДАНО {sdate} по {_to_float(d.get('site_sell_price')):.2f} $/шт"
+    return base + " · остаток на руках"
+
+
+def _delta_str(roi):
+    """Строка для delta метрики: '+12.3%' или None, если ROI не определён."""
+    return f"{roi:+.1f}%" if roi is not None else None
+
+
+# ===========================================================================
+# UI: ПОКУПКА (создание партии; опционально — часть/всё уже продано)
+# ===========================================================================
+
+def render_purchase():
+    """Запись покупки. Создаёт открытую партию (остаток на руках)."""
+    st.subheader("➕ Покупка")
+    st.caption("Запиши покупку — создастся остаток на руках. Продажи (в том числе по частям "
+               "в разные дни) оформляются ниже в «Продать из остатков».")
+
+    col_buy, col_sell = st.columns(2)
+
+    with col_buy:
+        st.markdown("#### 🏪 Покупка в Steam")
+        item_name = st.text_input("Название предмета", value="", key="buy_item",
+                                  placeholder="напр. AK-47 | Redline (FT)")
+        buy_d = st.date_input("Дата покупки", value=date.today(), key="buy_date", format="YYYY-MM-DD")
+        steam_price = st.number_input("Цена покупки в Steam, ₴ (за 1 шт.)",
+                                      min_value=0.0, value=0.0, step=0.01, format="%.2f", key="buy_price")
+        qty_bought = st.number_input("Сколько куплено", min_value=1, value=1, step=1, key="buy_qty")
+        deposit_profit = st.number_input("Чистый плюс пополнения Steam, %",
+                                         min_value=-99.9, value=DEFAULT_DEPOSIT_PROFIT,
+                                         step=0.01, format="%.2f", key="buy_deposit",
+                                         help="Потратил 10, получил 15 на баланс → 50%.")
+        buy_rate = st.number_input("Курс на момент покупки: ₴ в 1 $",
+                                   min_value=0.01, value=DEFAULT_RATE, step=0.01, format="%.2f", key="buy_rate",
+                                   help="Фиксирует долларовую себестоимость. Не меняется при будущих продажах.")
+
+    with col_sell:
+        st.markdown("#### 💳 Уже продано? (необязательно)")
+        sold_now = st.checkbox("Часть или всё уже продано", value=False, key="buy_sold_now",
+                               help="Включи, если оформляешь уже завершённую сделку. "
+                                    "Иначе продажу можно записать позже в «Продать из остатков».")
+        qty_sold = st.number_input("Сколько продано", min_value=0, max_value=int(qty_bought),
+                                   value=int(qty_bought), step=1, key="buy_qty_sold", disabled=not sold_now)
+        sell_d = st.date_input("Дата продажи", value=date.today(), key="buy_sell_date",
+                               format="YYYY-MM-DD", disabled=not sold_now)
+        site_price = st.number_input("Цена продажи на сайте, $ (за 1 шт.)",
+                                     min_value=0.0, value=0.0, step=0.01, format="%.2f",
+                                     key="buy_site_price", disabled=not sold_now)
+        sales_fee = st.number_input("Комиссия сайта за продажу, %",
+                                    min_value=0.0, max_value=100.0, value=DEFAULT_SALES_FEE,
+                                    step=0.01, format="%.2f", key="buy_sales_fee", disabled=not sold_now)
+        sell_rate = st.number_input("Курс на момент продажи: ₴ в 1 $",
+                                    min_value=0.01, value=DEFAULT_RATE, step=0.01, format="%.2f",
+                                    key="buy_sell_rate", disabled=not sold_now,
+                                    help="Используется только если часть продаётся сразу.")
+
+    # --- Предпросмотр ---
+    st.markdown("##### 📊 Предпросмотр")
+    cost_all = compute_deal(steam_price, qty_bought, deposit_profit, buy_rate, sold=False)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Стоимость всей покупки", f"{cost_all['real_cost_uah']:,.2f} ₴",
+              help=f"≈ {cost_all['real_cost_usd']:,.2f} $ по курсу покупки")
+
+    will_sell = min(int(qty_sold), int(qty_bought)) if sold_now else 0
+    if sold_now and will_sell > 0:
+        sale = compute_deal(steam_price, will_sell, deposit_profit, buy_rate, sell_uah_per_usd=sell_rate,
+                            sold=True, site_sell_price=site_price, sales_fee_pct=sales_fee)
+        c2.metric(f"Прибыль с продажи ({will_sell} шт)", f"{sale['profit_uah']:,.2f} ₴",
+                  delta=_delta_str(sale["roi_pct"]))
+        c3.metric("Прибыль, $", f"{sale['profit_usd']:,.2f} $")
+        remaining = int(qty_bought) - will_sell
+        if remaining > 0:
+            st.info(f"Будет создано: закрытая партия {will_sell} шт + открытый остаток {remaining} шт.")
+        else:
+            st.info(f"Будет создана закрытая партия на {will_sell} шт (остатка нет).")
+    else:
+        c2.metric("Статус", "Открытая позиция")
+        st.info(f"Будет создан остаток на руках: {int(qty_bought)} шт. Прибыль появится после продажи.")
+
+    # --- Сохранение ---
+    if st.button("💾 Добавить покупку", type="primary", use_container_width=True):
+        if not item_name.strip() and steam_price == 0.0:
+            st.warning("Укажи хотя бы название предмета или цену покупки.")
+            return
+        purchase = {
+            "item_name": item_name.strip(), "buy_date": _to_iso(buy_d),
+            "steam_buy_price": float(steam_price), "deposit_profit_pct": float(deposit_profit),
+            "buy_uah_per_usd": float(buy_rate),
+        }
+        try:
+            if sold_now and will_sell > 0:
+                # Закрытая часть и остаток одной покупки записываются АТОМАРНО и с
+                # общей группой (insert_deals_atomic назначит её по id первой части).
+                lots = [{**purchase, "quantity": will_sell, "sold": 1,
+                         "sell_date": _to_iso(sell_d), "site_sell_price": float(site_price),
+                         "sales_fee_pct": float(sales_fee), "sell_uah_per_usd": float(sell_rate)}]
+                remaining = int(qty_bought) - will_sell
+                if remaining > 0:
+                    lots.append({**purchase, "quantity": remaining, "sold": 0, "sell_date": "",
+                                 "site_sell_price": 0.0, "sales_fee_pct": 0.0, "sell_uah_per_usd": 0.0})
+                insert_deals_atomic(lots)
+            else:
+                insert_deal({**purchase, "quantity": int(qty_bought), "sold": 0, "sell_date": "",
+                             "site_sell_price": 0.0, "sales_fee_pct": 0.0, "sell_uah_per_usd": 0.0})
+        except Exception as e:
+            st.error(f"Не удалось сохранить покупку в базу: {e}. Данные не записаны — попробуй ещё раз.")
+        else:
+            st.success("Покупка добавлена.")
+            st.rerun()
+
+
+# ===========================================================================
+# UI: ПРОДАЖА ИЗ ОСТАТКОВ (частичная или полная продажа открытой партии)
+# ===========================================================================
+
+def render_sell_from_holdings(deals):
+    """Продажа из выбранной открытой партии — полностью или частично."""
+    st.subheader("💰 Продать из остатков")
+
+    lots = open_lots(deals)
+    if not lots:
+        st.info("Открытых позиций нет. Сначала добавь покупку выше.")
+        return
+
+    st.caption("Выбери позицию и укажи, сколько продаёшь. Можно продать часть — остаток "
+               "сохранится на руках, и его можно будет продать позже по другой цене.")
+
+    lot_map = {int(d["id"]): d for d in lots}
+    selected_id = st.selectbox("Позиция (остаток на руках)", list(lot_map.keys()),
+                               format_func=lambda i: lot_label(lot_map[i]), key="sell_lot")
+    lot = lot_map[selected_id]
+    open_qty = _to_int(lot["quantity"], 1)
+
+    # Курс покупки берём строго из записи; если его там нет — честно предупреждаем.
+    lot_buy_rate = _to_float(lot.get("buy_uah_per_usd"))
+    if lot_buy_rate <= 0:
+        st.warning("У этой партии не задан курс покупки — долларовая себестоимость будет неверной. "
+                   "Исправь курс покупки в журнале ниже.")
 
     col_a, col_b = st.columns(2)
     with col_a:
-        fee_percent = st.number_input(
-            _("Top-up fee (%)"),
-            min_value=0.0, value=float(template.get("percent_fee", 0.0)), step=0.5,
-            key=f"{key_prefix}_percent_{template_name}",   # ключ зависит от профиля
-        )
+        sell_qty = st.number_input("Сколько продать", min_value=1, max_value=open_qty,
+                                   value=open_qty, step=1, key=f"sell_qty_{selected_id}")
+        sell_d = st.date_input("Дата продажи", value=date.today(),
+                               key=f"sell_date_{selected_id}", format="YYYY-MM-DD")
     with col_b:
-        fixed_fee_usd = st.number_input(
-            _("Fixed fee (USD)"),
-            min_value=0.0, value=float(template.get("fixed_fee_usd", 0.0)), step=0.05,
-            key=f"{key_prefix}_fixed_{template_name}",      # ключ зависит от профиля
-        )
-    return fee_percent, fixed_fee_usd
+        site_price = st.number_input("Цена продажи на сайте, $ (за 1 шт.)", min_value=0.0,
+                                     value=0.0, step=0.01, format="%.2f", key=f"sell_price_{selected_id}")
+        sales_fee = st.number_input("Комиссия сайта за продажу, %", min_value=0.0, max_value=100.0,
+                                    value=DEFAULT_SALES_FEE, step=0.01, format="%.2f", key=f"sell_fee_{selected_id}")
+    sell_rate = st.number_input("Курс на момент ЭТОЙ продажи: ₴ в 1 $", min_value=0.01,
+                                value=DEFAULT_RATE, step=0.01, format="%.2f", key=f"sell_rate_{selected_id}",
+                                help="Курс именно на дату продажи. Себестоимость считается по курсу покупки отдельно.")
 
-
-def resolve_fixed_fee_in_target(key_prefix, fixed_fee_usd, enable_fees, advanced,
-                                display_ccy, spent_ccy, site_ccy, rate_site_to_spent):
-    """Приводит фиксированную комиссию из долларов к валюте расчёта затрат.
-
-    Рендерится внутри st.form. Целевая валюта зависит от режима:
-        * обычный режим      — валюта отображения (display_ccy);
-        * мультивалютный     — валюта сайта (site_ccy), которая позже
-                               домножается на кросс-курс.
-
-    Определение курса доллара:
-        * если целевая валюта уже доллар — конвертация не требуется;
-        * в мультивалютном режиме при затратах в долларах курс доллара к валюте
-          сайта вычисляется из введённого кросс-курса (1 / rate_site_to_spent);
-        * иначе отображается отдельное поле для ввода курса.
-
-    Возвращает фиксированную комиссию в целевой валюте (неотрицательное число).
-    """
-    if not enable_fees or fixed_fee_usd <= 0:
-        return 0.0
-
-    # --- Простой режим: цель = валюта отображения ---
-    if not advanced:
-        if is_usd_currency(display_ccy):
-            return float(fixed_fee_usd)
-        usd_to_disp = st.number_input(
-            _("Rate: how many {a} in 1 {b}").format(a=display_ccy, b="USD"),
-            min_value=0.0, value=default_usd_rate(display_ccy), step=0.5,
-            key=f"{key_prefix}_usd_rate",
-        )
-        return float(fixed_fee_usd) * usd_to_disp
-
-    # --- Продвинутый режим: цель = валюта сайта ---
-    if is_usd_currency(site_ccy):
-        return float(fixed_fee_usd)
-
-    # Если затраты в USD — выводим курс USD→сайт из существующего кросс-курса.
-    if is_usd_currency(spent_ccy) and rate_site_to_spent and rate_site_to_spent > 0:
-        usd_to_site = 1.0 / float(rate_site_to_spent)  # 1 USD = 1 / (курс сайта к валюте затрат)
-        st.caption(_("USD fixed fee converted via your existing cross-rate."))
-        return float(fixed_fee_usd) * usd_to_site
-
-    # Иначе — явное поле курса USD → валюта сайта.
-    usd_to_site = st.number_input(
-        _("Rate: how many {a} in 1 {b}").format(a=site_ccy or "?", b="USD"),
-        min_value=0.0, value=1.0, step=0.5,
-        key=f"{key_prefix}_usd_rate",
-    )
-    return float(fixed_fee_usd) * usd_to_site
-
-
-def render_cross_currency_selectors(key_prefix):
-    """Рендерит ВНЕ формы три текстовых поля валют (карта/сайт/Steam).
-
-    Вне формы — чтобы зависимое поле «курс USD → валюта сайта» появлялось
-    динамически. Возвращает (spent_ccy, site_ccy, steam_ccy).
-    """
-    st.markdown("#### 🌍 " + _("Cross-currency settings"))
+    # --- Предпросмотр продажи выбранного количества (два курса) ---
+    sale = compute_deal(lot.get("steam_buy_price", 0.0), int(sell_qty),
+                        lot.get("deposit_profit_pct", 0.0),
+                        buy_uah_per_usd=lot_buy_rate, sell_uah_per_usd=sell_rate,
+                        sold=True, site_sell_price=site_price, sales_fee_pct=sales_fee)
+    st.markdown("##### 📊 Предпросмотр продажи")
     c1, c2, c3 = st.columns(3)
-    with c1:
-        spent_ccy = st.text_input(_("Spent currency (e.g. UAH)"), value="UAH", key=f"{key_prefix}_spent_ccy")
-    with c2:
-        site_ccy = st.text_input(_("Site currency (e.g. USD)"), value="USD", key=f"{key_prefix}_site_ccy")
-    with c3:
-        steam_ccy = st.text_input(_("Steam currency (e.g. EUR)"), value="EUR", key=f"{key_prefix}_steam_ccy")
-    return spent_ccy, site_ccy, steam_ccy
-
-
-def render_cross_currency_rates(key_prefix, spent_ccy, site_ccy, steam_ccy):
-    """Рендерит ВНУТРИ формы два курса к валюте затрат.
-
-    Возвращает (rate_site_to_spent, rate_steam_to_spent).
-    """
-    spent_lbl = spent_ccy or "?"
-    r1, r2 = st.columns(2)
-    with r1:
-        rate_site_to_spent = st.number_input(
-            _("Rate: how many {a} in 1 {b}").format(a=spent_lbl, b=site_ccy or "?"),
-            min_value=0.0, value=41.0, step=0.5, key=f"{key_prefix}_rate_site",
-        )
-    with r2:
-        rate_steam_to_spent = st.number_input(
-            _("Rate: how many {a} in 1 {b}").format(a=spent_lbl, b=steam_ccy or "?"),
-            min_value=0.0, value=45.0, step=0.5, key=f"{key_prefix}_rate_steam",
-        )
-    st.caption(_("Both rates are in the spent currency per 1 unit (a common base)."))
-    return rate_site_to_spent, rate_steam_to_spent
-
-
-def render_m5_tp_block():
-    """Блок «учёт цен Steam (ТП)» для Режима 5. Рендерится ВНЕ формы, чтобы тумблер
-    сразу показывал/прятал поля. Возвращает dict: enabled, real_ccy, site_ccy,
-    steam_ccy, rate_site, rate_steam, topup. Курсы — «реальной валюты за 1 единицу»,
-    как в режимах 1–4. По умолчанию курсы 1.0 и бонус 0%% — тогда суммы не меняются."""
-    enabled = st.checkbox(_("Account for Steam (TP) prices"), value=False,
-                          key="m5_tp_enable", help=_("m5_tp_help"))
-    tp = {"enabled": bool(enabled), "real_ccy": "USD", "site_ccy": "USD",
-          "steam_ccy": "USD", "rate_site": 1.0, "rate_steam": 1.0, "topup": 0.0}
-    if not enabled:
-        return tp
-    st.markdown("#### 💱 " + _("Steam (TP) pricing settings"))
-    c1, c2, c3 = st.columns(3)
-    tp["site_ccy"] = c1.text_input(_("External sites currency"), value="USD", key="m5_tp_site_ccy")
-    tp["steam_ccy"] = c2.text_input(_("Steam currency"), value="USD", key="m5_tp_steam_ccy")
-    tp["real_ccy"] = c3.text_input(_("Real currency (you pay in)"), value="USD", key="m5_tp_real_ccy")
-    real_lbl = tp["real_ccy"] or "?"
-    r1, r2 = st.columns(2)
-    tp["rate_steam"] = r1.number_input(
-        _("Rate: how many {a} in 1 {b}").format(a=real_lbl, b=tp["steam_ccy"] or "?"),
-        min_value=0.0, value=1.0, step=0.5, key="m5_tp_rate_steam")
-    tp["rate_site"] = r2.number_input(
-        _("Rate: how many {a} in 1 {b}").format(a=real_lbl, b=tp["site_ccy"] or "?"),
-        min_value=0.0, value=1.0, step=0.5, key="m5_tp_rate_site")
-    tp["topup"] = st.number_input(_("Steam top-up bonus %"), min_value=-99.9, value=0.0,
-                                  step=1.0, key="m5_tp_topup")
-    st.caption(_("Prices are converted to your real currency; for each item the CHEAPER of market vs Steam is used."))
-    return tp
-
-
-
-# ===========================================================================
-# НОВОСТНАЯ ЛЕНТА (статичные сообщения — редактируются прямо здесь)
-# ===========================================================================
-# Сообщения едут вместе с кодом: их увидит каждый, кто запустил ЭТУ версию —
-# и на Streamlit Cloud, и локально. Никаких запросов в сеть: новости не могут
-# ничего сломать, подтянуть чужой текст или утечь наружу.
-#
-# Как добавить новость — допиши элемент в начало списка NEWS:
-#     {
-#         "date": "2026-07-15",          # дата (YYYY-MM-DD) — сохраняется здесь же
-#         "kind": "update",              # info | update | fix | warning (иконка)
-#         "text": "Короткий текст",      # одна строка на всех языках...
-#     },
-#     {
-#         "date": "2026-07-20",
-#         "kind": "info",
-#         "text": {                      # ...или отдельный текст на каждый язык
-#             "ru": "Текст по-русски",   # (можно заполнить не все — подставится
-#             "en": "Text in English",   #  любой доступный)
-#             "ua": "Текст українською",
-#         },
-#     },
-# Порядок в списке не важен: лента сама сортируется по дате (новые сверху).
-# В тексте работает markdown: **жирный**, *курсив*, [ссылка](https://...).
-# HTML намеренно НЕ выполняется (st.markdown без unsafe_allow_html) — безопасно.
-NEWS_KIND_ICONS = {"info": "📣", "update": "🆕", "fix": "🔧", "warning": "⚠️"}
-NEWS_FRESH_DAYS = 14   # сколько дней новость считается свежей (лента раскрыта сразу)
-NEWS_MAX_SHOWN = 5     # сколько последних новостей показывать без «показать все»
-
-NEWS = [
-    {
-        "date": "2026-07-11",
-        "kind": "update",
-        "text": {
-            "ru": "**Режим 5 (коллекции):** контракты 10→1 считаются на реальных записях — "
-                  "два режима подбора филлеров (по самым дешёвым / по лучшему соотношению "
-                  "цена-качество), таблица «что покупать» по каждой редкости, учёт цен Steam (ТП) "
-                  "и шаблоны коллекций (Cobblestone, Overpass 2024). Доходность теперь "
-                  "показывается как полный возврат: 100% = в ноль, 105% = +5% прибыли.",
-            "en": "**Mode 5 (collections):** 10→1 trade-ups are computed on your actual records — "
-                  "two filler strategies (cheapest / best price-quality), a \"what to buy\" table per "
-                  "rarity, optional Steam (TP) prices and ready-made collection templates "
-                  "(Cobblestone, Overpass 2024). Returns are now shown in full: 100% = break-even, "
-                  "105% = +5% profit.",
-            "ua": "**Режим 5 (колекції):** контракти 10→1 рахуються на реальних записах — "
-                  "два режими добору філерів (за найдешевшими / за найкращим співвідношенням "
-                  "ціна-якість), таблиця «що купувати» для кожної рідкості, облік цін Steam (ТП) "
-                  "і шаблони колекцій (Cobblestone, Overpass 2024). Дохідність тепер показується "
-                  "як повне повернення: 100% = у нуль, 105% = +5% прибутку.",
-        },
-    },
-]
-
-
-def _news_date(item):
-    """Дата новости как объект date (для сортировки).
-
-    Кривой/пустой формат не роняет приложение: такая новость просто уходит вниз
-    ленты (date.min). Новости не должны ломать калькулятор ни при каких данных.
-    """
-    try:
-        return date.fromisoformat(str(item.get("date", "")))
-    except (ValueError, TypeError, AttributeError):
-        return date.min
-
-
-def _news_text(item):
-    """Текст новости на активном языке.
-
-    text может быть строкой (одна на всех) или словарём {'ru': ..., 'en': ..., 'ua': ...}.
-    Если перевода на активный язык нет — подставляется любой доступный (en → ru → ua),
-    чтобы сообщение не пропало.
-    """
-    txt = item.get("text")
-    if isinstance(txt, dict):
-        for code in (_CURRENT_LANG, "en", "ru", "ua"):
-            val = txt.get(code)
-            if val:
-                return str(val)
-        return next((str(v) for v in txt.values() if v), "")
-    return str(txt or "")
-
-
-def news_sorted(items=None):
-    """Новости от свежих к старым (устойчиво к некорректным датам)."""
-    return sorted(items if items is not None else NEWS,
-                  key=_news_date, reverse=True)
-
-
-def render_news():
-    """Лента новостей под заголовком. Пустой список NEWS — блок не рисуется вовсе."""
-    items = [it for it in news_sorted() if _news_text(it)]
-    if not items:
-        return
-    newest = _news_date(items[0])
-    fresh = (newest != date.min
-             and 0 <= (date.today() - newest).days <= NEWS_FRESH_DAYS)
-    title = "📣 " + _("News")
-    if newest != date.min:
-        title += f" · {newest.isoformat()}"
-    with st.expander(title, expanded=fresh):
-        shown = items[:NEWS_MAX_SHOWN]
-        rest = items[NEWS_MAX_SHOWN:]
-        if rest and st.checkbox(_("Show all news"), value=False, key="news_show_all"):
-            shown = items
-        for it in shown:
-            icon = NEWS_KIND_ICONS.get(it.get("kind", "info"), "📣")
-            day = it.get("date", "")
-            # Без unsafe_allow_html: markdown работает, HTML не выполняется.
-            st.markdown(f"{icon} **{day}** — {_news_text(it)}")
-
-
-# ===========================================================================
-# РЕЖИМ 1: КАЛЬКУЛЯТОР ПОПОЛНЕНИЯ БАЛАНСА STEAM
-# ===========================================================================
-
-def calculate_mode_1(currency, advanced):
-    """Интерфейс Режима 1. currency — валюта отображения; advanced — режим кросс-курсов."""
-    st.subheader("💰 " + _("Steam balance top-up calculator"))
-    st.write(_("We calculate the final profit from buying a skin on a third-party site "
-               "and selling it on the Steam Market."))
-
-    # --- ВНЕ формы: шаблон комиссии + (опц.) валюты кросс-курсов ---
-    template_name, enable_fees = render_fee_template_controls("m1")
-    spent_ccy = site_ccy = steam_ccy = None
-    if advanced:
-        spent_ccy, site_ccy, steam_ccy = render_cross_currency_selectors("m1")
-
-    # Значения по умолчанию (на случай отключённых блоков).
-    fee_percent, fixed_fee_usd = 0.0, 0.0
-    rate_site_to_spent, rate_steam_to_spent = 1.0, 1.0
-
-    # Поля и кнопка внутри st.form: пересчёт выполняется только по нажатию.
-    with st.form("m1_form"):
-        col_buy, col_sell = st.columns(2)
-
-        with col_buy:
-            st.markdown("#### 🛒 " + _("Purchase (third-party site)"))
-            site_price = st.number_input(
-                _("Skin price on third-party site"),
-                min_value=0.0, value=10.0, step=0.5, key="m1_site_price",
-            )
-            quantity = st.number_input(
-                _("Quantity"), min_value=1, value=1, step=1, key="m1_qty",
-            )
-            fee_percent, fixed_fee_usd = render_fee_value_inputs("m1", template_name, enable_fees)
-
-        with col_sell:
-            st.markdown("#### 🏪 " + _("Sale (Steam Market)"))
-            steam_price = st.number_input(
-                _("Steam sale price"),
-                min_value=0.0, value=15.0, step=0.5, key="m1_steam_price",
-            )
-            steam_fee = st.number_input(
-                _("Steam sale fee (%)"),
-                min_value=0.0, max_value=100.0, value=DEFAULT_STEAM_FEE_PERCENT, step=0.5,
-                key="m1_steam_fee", help=_("Default 15% = 10% CS2 fee + 5% Steam fee."),
-            )
-            manual_integer = st.checkbox(
-                _("Currency without cents (integers only)"),
-                value=False, key="m1_manual_integer",
-                help=_("Forces integer Steam pricing. Auto-enabled for ₴ / UAH."),
-            )
-
-        if advanced:
-            st.divider()
-            rate_site_to_spent, rate_steam_to_spent = render_cross_currency_rates(
-                "m1", spent_ccy, site_ccy, steam_ccy)
-
-        # Конвертация фиксы из USD в целевую валюту (поле появляется при нужде).
-        fixed_in_target = resolve_fixed_fee_in_target(
-            "m1", fixed_fee_usd, enable_fees, advanced,
-            currency, spent_ccy, site_ccy, rate_site_to_spent)
-
-        submitted = st.form_submit_button("🧮 " + _("Calculate"),
-                                          type="primary", use_container_width=True)
-
-    # --- Результаты (только после нажатия) ---
-    if not submitted:
-        st.info(_("Press Calculate to see the results."))
-        return
-
-    # Валютный контекст вывода.
-    if advanced:
-        steam_side_ccy = steam_ccy
-        output_ccy = spent_ccy or DEFAULT_CURRENCY
+    c1.metric("Реальная стоимость", f"{sale['real_cost_uah']:,.2f} ₴", help=f"≈ {sale['real_cost_usd']:,.2f} $ по курсу покупки")
+    c2.metric("Прибыль", f"{sale['profit_uah']:,.2f} ₴", delta=_delta_str(sale["roi_pct"]))
+    c3.metric("Прибыль, $", f"{sale['profit_usd']:,.2f} $")
+    remaining = open_qty - int(sell_qty)
+    if remaining > 0:
+        st.caption(f"После продажи на руках останется {remaining} шт (открытая позиция).")
     else:
-        steam_side_ccy = currency
-        output_ccy = currency
+        st.caption("Продаётся весь остаток — позиция закроется полностью.")
 
-    quantity = max(1, int(quantity))
+    if st.button("💾 Записать продажу", type="primary", use_container_width=True):
+        try:
+            updates, inserts, dels = replace_lot_with_sale(
+                deals, selected_id, int(sell_qty), _to_iso(sell_d),
+                float(site_price), float(sales_fee), float(sell_rate))
+            apply_changes(updates, inserts, dels)
+        except Exception as e:
+            st.error(f"Не удалось записать продажу: {e}. Данные не изменены — попробуй ещё раз.")
+        else:
+            st.success("Продажа записана.")
+            st.rerun()
 
-    # Без цены скина считать нечего: даже при включённой фиксе площадки (которая
-    # сама по себе делает затраты > 0) показывать «профит» бессмысленно.
-    if site_price <= 0:
-        st.info(_("Enter a skin price to see the calculation."))
+
+# ===========================================================================
+# UI: ЖУРНАЛ (редактируемая таблица партий) + ПРОВЕРКА ДАННЫХ
+# ===========================================================================
+
+def render_data_checks(deals, label_suffix=""):
+    """Блок проверки: предупреждения о несоответствиях и сверка по покупкам."""
+    warns = validate_deals(deals)
+    recon = reconcile_purchases(deals)
+    title = "🔎 Проверка данных и сверка по покупкам"
+    if label_suffix:
+        title += f" ({label_suffix})"
+    if warns:
+        title += f" — ⚠️ {len(warns)}"
+    with st.expander(title, expanded=bool(warns)):
+        if warns:
+            for w in warns:
+                st.warning(w)
+        else:
+            st.success("Несоответствий не найдено.")
+        if recon:
+            st.markdown("##### Сверка по покупкам")
+            st.dataframe(pd.DataFrame(recon), hide_index=True, use_container_width=True)
+            st.caption("«Всего» = продано + на руках по каждой покупке. Если это число не "
+                       "совпадает с тем, что ты реально покупал — поправь количества в журнале.")
+
+
+def _filter_and_sort_deals(deals, query, sort_mode):
+    """Возвращает партии для отображения: фильтр по названию + сортировка.
+
+    ВАЖНО: порядок этого списка должен совпадать с порядком строк в редакторе,
+    потому что сохранение правок привязывает позицию строки к элементу этого
+    же списка (а через него — к стабильному id). Поэтому ровно этот список
+    передаётся и в build_dataframe, и в diff_editor_state.
+
+    query     — подстрока названия (регистронезависимо); пусто => без фильтра.
+    sort_mode — 'Дата (новые сверху)' | 'Дата (старые сверху)' |
+                'Название (А→Я)' | 'Название (Я→А)'.
+    """
+    q = (query or "").strip().lower()
+    if q:
+        view = [d for d in deals if q in (str(d.get("item_name") or "").lower())]
+    else:
+        view = list(deals)
+
+    def _name_key(d):
+        return (str(d.get("item_name") or "").strip().lower(), d.get("id", 0))
+
+    def _date_key(d):
+        return (_parse_iso(d.get("buy_date")) or date.min, d.get("id", 0))
+
+    if sort_mode == "Название (А→Я)":
+        view.sort(key=_name_key)
+    elif sort_mode == "Название (Я→А)":
+        view.sort(key=_name_key, reverse=True)
+    elif sort_mode == "Дата (старые сверху)":
+        view.sort(key=_date_key)
+    else:  # 'Дата (новые сверху)' — по умолчанию
+        view.sort(key=_date_key, reverse=True)
+    return view
+
+
+def render_ledger(deals):
+    """Редактируемая таблица всех партий: правка любых полей и удаление строк.
+
+    Сохранение — точечными UPDATE/INSERT/DELETE по стабильным id (id строк не
+    меняются). Предупреждения и сверка показываются и по сохранённым данным, и
+    по предварительному состоянию из текущих правок редактора.
+
+    Поиск и сортировка не влияют на сохранность данных: правки привязываются к
+    строке по её скрытому id, а не по позиции на экране, поэтому фильтрация и
+    смена порядка строк безопасны.
+    """
+    st.subheader("📒 Журнал партий")
+
+    if not deals:
+        st.info("Журнал пуст. Добавь первую покупку выше.")
         return
 
-    # Целочисленный режим — по валюте стороны Steam или ручной галочке.
-    integer_mode = manual_integer or is_integer_currency(steam_side_ccy)
+    # --- Поиск по названию + сортировка ---
+    col_search, col_sort = st.columns([2, 1])
+    with col_search:
+        query = st.text_input("🔍 Поиск по названию предмета", value="",
+                              key="ledger_search",
+                              placeholder="например: AK-47 или Redline").strip()
+    with col_sort:
+        sort_mode = st.selectbox(
+            "Сортировка",
+            ["Дата (новые сверху)", "Дата (старые сверху)", "Название (А→Я)", "Название (Я→А)"],
+            index=0, key="ledger_sort")
 
-    # Выручка продавца за 1 предмет считается по точной модели Steam (floor с
-    # минимумом в одну единицу) в наименьшей единице валюты. Суммарный процент
-    # комиссии распределяется на издательскую и площадочную части (10:5).
-    cs2_fee_pct, steam_fee_pct = _split_total_fee(steam_fee)
-    seller_unit, valid_buyer, fee_cs_unit, fee_steam_unit = calculate_exact_steam_revenue(
-        steam_price, integer_mode, cs2_fee_pct, steam_fee_pct)
-    steam_received_unit = float(seller_unit)
-    integer_detail = (valid_buyer, seller_unit)
+    view_deals = _filter_and_sort_deals(deals, query, sort_mode)
 
-    # Предупреждение нужно только для целочисленных валют: там не каждая цена
-    # листинга достижима и могла быть приведена к ближайшей возможной. Сравниваем
-    # с тем же нормализованным вводом, что использует решатель (round half up),
-    # иначе на .5-значениях (шаг 0.5) предупреждение срабатывало бы ложно.
-    integer_warning = None
-    if integer_mode:
-        requested_unit = round_half_up_int(steam_price)
-        achievable_unit = int(round(valid_buyer))
-        if achievable_unit != requested_unit:
-            integer_warning = (requested_unit, achievable_unit)
-
-    # Выручка за всё количество (в валюте стороны Steam); конвертация — далее.
-    steam_received_total = steam_received_unit * quantity
-
-    # Реальные затраты на сайте (фикса уже в целевой валюте) за всё количество.
-    site_real_cost = calculate_real_spent(site_price, fee_percent, fixed_in_target, quantity)
-
-    # Приведение к базовой валюте и итоговый плюс.
-    if advanced:
-        real_spent_base, steam_received_base, profit_amount, profit_percent = \
-            calculate_profit_cross_currency(
-                site_real_cost, steam_received_total, rate_site_to_spent, rate_steam_to_spent)
+    if query and not view_deals:
+        st.warning(f"По запросу «{query}» ничего не найдено. Очисти поиск, чтобы увидеть все партии.")
+        return
+    if query:
+        st.caption(f"Найдено партий: {len(view_deals)} из {len(deals)}. "
+                   "Правки в отфильтрованном виде сохраняются в правильные партии. "
+                   "⚠️ Несохранённые правки сбросятся при смене текста поиска или сортировки — "
+                   "сначала нажми «Сохранить изменения».")
     else:
-        real_spent_base = site_real_cost
-        steam_received_base = steam_received_total
-        profit_amount, profit_percent = calculate_profit(real_spent_base, steam_received_base)
+        st.caption("Каждая строка — партия (часть покупки). Любое поле, включая количество и оба "
+                   "курса, можно править прямо здесь; строки можно удалять (выдели строку → Delete). "
+                   "Серые колонки считаются автоматически. После правок нажми «Сохранить изменения». "
+                   "Правки ручные и не пересчитывают другие партии — сверяйся с блоком ниже.")
 
-    # --- Вывод результатов ---
-    st.divider()
-    st.markdown("### 📊 " + _("Results"))
-
-    if integer_warning is not None:
-        x, y = integer_warning
-        st.warning(_("Price {x} is impossible in Steam for integer currencies. "
-                     "Rounded to the nearest possible: {y}.").format(x=x, y=y))
-
-    # В целочисленном одновалютном режиме «Получено» — целое (без копеек).
-    received_decimals = 0 if (integer_mode and not advanced) else 2
-
-    m_spent, m_received, m_profit = st.columns(3)
-    m_spent.metric(_("Real spent"), format_currency(real_spent_base, output_ccy))
-    m_received.metric(_("Steam received"),
-                      format_currency(steam_received_base, output_ccy, received_decimals))
-    m_profit.metric(
-        _("Net profit"),
-        format_currency(profit_amount, output_ccy),
-        delta=f"{profit_percent:+.2f}%",   # зелёный для плюса, красный для минуса
+    df = build_dataframe(view_deals)
+    # Ключ редактора зависит от вида (число строк + поиск + сортировка) И от содержимого
+    # видимых партий: при смене вида ИЛИ после сохранения (данные изменились, но число
+    # строк осталось прежним) Streamlit пересоздаёт виджет, а не подмешивает устаревшие
+    # правки. Подпись считается по СОХРАНЁННЫМ данным (view_deals), поэтому во время
+    # редактирования (до сохранения) ключ стабилен и правки не сбрасываются.
+    import hashlib
+    data_sig = hashlib.md5(repr([
+        (d.get("id"), d.get("item_name"), _to_iso(d.get("buy_date")),
+         _to_float(d.get("steam_buy_price")), _to_int(d.get("quantity"), 0),
+         _to_float(d.get("deposit_profit_pct")), _to_float(d.get("buy_uah_per_usd")),
+         _to_bool(d.get("sold")), _to_iso(d.get("sell_date")),
+         _to_float(d.get("site_sell_price")), _to_float(d.get("sales_fee_pct")),
+         _to_float(d.get("sell_uah_per_usd")))
+        for d in view_deals
+    ]).encode("utf-8")).hexdigest()[:10]
+    view_sig = f"{len(df)}_{query.lower()}_{sort_mode}_{data_sig}"
+    editor_key = f"ledger_editor_{view_sig}"
+    column_order = INPUT_COLUMNS + COMPUTED_COLUMNS  # _id и _lot_group скрыты
+    edited_df = st.data_editor(
+        df, column_config=column_config(), disabled=COMPUTED_COLUMNS,
+        num_rows="dynamic", hide_index=True, use_container_width=True,
+        key=editor_key, column_order=column_order,
     )
 
-    # Пояснение для целочисленного режима (за 1 предмет).
-    if integer_mode and integer_detail is not None:
-        buyer_pays, seller_receive = integer_detail
-        st.caption(_("Buyer pays {buyer} · you receive {seller} (per item)").format(
-            buyer=format_currency(buyer_pays, steam_side_ccy, 0),
-            seller=format_currency(seller_receive, steam_side_ccy, 0)))
-        st.caption(_("Steam fees are floored to whole units with a 1-unit minimum, "
-                     "following Steam's exact fee model."))
+    # Предварительная проверка по ТЕКУЩИМ правкам в редакторе (а не только по БД).
+    preview_visible = dataframe_to_preview_deals(edited_df)
 
-    # В продвинутом режиме — промежуточные суммы в исходных валютах.
-    if advanced:
-        st.caption(
-            f"{_('Site cost')}: {format_currency(site_real_cost, site_ccy or '?')} · "
-            f"{_('Steam proceeds')}: "
-            f"{format_currency(steam_received_total, steam_side_ccy or '?', received_decimals)}")
-
-    # --- Итоговый вердикт ---
-    if real_spent_base <= 0:
-        st.info(_("Enter a skin price to see the calculation."))
-    elif profit_amount > 0:
-        st.success(_("Top-up in profit: +{amount} ({percent}).").format(
-            amount=format_currency(profit_amount, output_ccy), percent=f"{profit_percent:+.2f}%"))
-    elif profit_amount < 0:
-        st.error(_("Top-up at a loss: {amount} ({percent}).").format(
-            amount=format_currency(profit_amount, output_ccy), percent=f"{profit_percent:+.2f}%"))
-    else:
-        st.warning(_("Break-even result."))
-
-    with st.expander("ℹ️ " + _("Calculation formulas")):
-        st.markdown(_("MODE1_FORMULAS"))
-
-
-# ===========================================================================
-# РЕЖИМ 2: АНАЛИЗАТОР ВЫГОДНОЙ ПОКУПКИ ("ГДЕ КУПИТЬ ВЫГОДНЕЕ?")
-# ===========================================================================
-
-def calculate_mode_2(currency, advanced):
-    """Интерфейс Режима 2. currency — валюта отображения; advanced — режим кросс-курсов."""
-    st.subheader("🔍 " + _("Where to buy cheaper?"))
-    st.write(_("We compare buying a skin directly on a third-party site with real money "
-               "versus buying it on the Steam Market with a balance topped up 'in profit'."))
-
-    # --- ВНЕ формы: шаблон комиссии + (опц.) валюты кросс-курсов ---
-    template_name, enable_fees = render_fee_template_controls("m2")
-    spent_ccy = site_ccy = steam_ccy = None
-    if advanced:
-        spent_ccy, site_ccy, steam_ccy = render_cross_currency_selectors("m2")
-
-    fee_percent, fixed_fee_usd = 0.0, 0.0
-    rate_site_to_spent, rate_steam_to_spent = 1.0, 1.0
-
-    # --- Форма ---
-    with st.form("m2_form"):
-        col_steam, col_site = st.columns(2)
-
-        with col_steam:
-            st.markdown("#### 🏪 " + _("Buy on Steam Market"))
-            steam_price = st.number_input(
-                _("Current Steam Market price"),
-                min_value=0.0, value=15.0, step=0.5, key="m2_steam_price",
-            )
-            deposit_profit = st.number_input(
-                _("Steam top-up profit (%)"),
-                min_value=-99.9, value=50.0, step=1.0, key="m2_deposit_profit",
-                help=_("How profitably you topped up Steam earlier. "
-                       "Example: spent 10 real, got 15 on balance → 50% profit."),
-            )
-
-        with col_site:
-            st.markdown("#### 🛒 " + _("Buy on third-party site"))
-            site_price = st.number_input(
-                _("Skin price on third-party site"),
-                min_value=0.0, value=12.0, step=0.5, key="m2_site_price",
-            )
-            quantity = st.number_input(
-                _("Quantity"), min_value=1, value=1, step=1, key="m2_qty",
-            )
-            fee_percent, fixed_fee_usd = render_fee_value_inputs("m2", template_name, enable_fees)
-
-        if advanced:
-            st.divider()
-            rate_site_to_spent, rate_steam_to_spent = render_cross_currency_rates(
-                "m2", spent_ccy, site_ccy, steam_ccy)
-
-        fixed_in_target = resolve_fixed_fee_in_target(
-            "m2", fixed_fee_usd, enable_fees, advanced,
-            currency, spent_ccy, site_ccy, rate_site_to_spent)
-
-        submitted = st.form_submit_button("🧮 " + _("Calculate"),
-                                          type="primary", use_container_width=True)
-
-    # --- Результаты ---
-    if not submitted:
-        st.info(_("Press Calculate to see the results."))
-        return
-
-    if advanced:
-        steam_side_ccy = steam_ccy
-        output_ccy = spent_ccy or DEFAULT_CURRENCY
-    else:
-        steam_side_ccy = currency
-        output_ccy = currency
-
-    quantity = max(1, int(quantity))
-
-    # Затраты на сайте (фикса уже в целевой валюте) за всё количество.
-    site_real_cost = calculate_real_spent(site_price, fee_percent, fixed_in_target, quantity)
-
-    # Сторона Steam: цена сначала приводится к целому для целочисленных валют
-    # (округление «half up», как в решателе), затем применяется выгода пополнения
-    # и только потом — конвертация.
-    integer_mode = is_integer_currency(steam_side_ccy)
-    if integer_mode:
-        unit_price = float(round_half_up_int(steam_price))
-        if unit_price != float(steam_price):
-            st.warning(_("Steam has no fractions for this currency; price rounded to {y}.").format(
-                y=int(unit_price)))
-    else:
-        unit_price = float(steam_price)
-    steam_nominal = unit_price * quantity
-    steam_real_cost = calculate_steam_real_cost(steam_nominal, deposit_profit)
-
-    # Приведение к базовой валюте.
-    if advanced:
-        site_real_base = max(0.0, site_real_cost) * max(0.0, rate_site_to_spent)
-        steam_real_base = max(0.0, steam_real_cost) * max(0.0, rate_steam_to_spent)
-    else:
-        site_real_base = site_real_cost
-        steam_real_base = steam_real_cost
-
-    result = compare_purchase_options(site_real_base, steam_real_base)
-
-    # --- Вывод ---
-    st.divider()
-    st.markdown("### 📊 " + _("Results comparison"))
-
-    m_site, m_steam = st.columns(2)
-    m_site.metric(_("Real price (third-party site)"), format_currency(site_real_base, output_ccy))
-    m_steam.metric(_("Real price (Steam, with profit)"), format_currency(steam_real_base, output_ccy))
-
-    if advanced:
-        st.caption(
-            f"{_('Site cost')}: {format_currency(site_real_cost, site_ccy or '?')} · "
-            f"{_('Steam cost')}: {format_currency(steam_real_cost, steam_side_ccy or '?')}")
-
-    if site_real_base <= 0 and steam_real_base <= 0:
-        st.info(_("Enter data to see the comparison."))
-    elif result["recommendation"] == "steam":
-        st.success(_("Cheaper to buy on Steam. Savings: {amount}.").format(
-            amount=format_currency(result["savings"], output_ccy)))
-    elif result["recommendation"] == "site":
-        st.success(_("Cheaper to buy on the third-party site. Savings: {amount}.").format(
-            amount=format_currency(result["savings"], output_ccy)))
-    else:
-        st.warning(_("Both options cost the same in real money."))
-
-    with st.expander("ℹ️ " + _("Calculation formulas")):
-        st.markdown(_("MODE2_FORMULAS"))
-
-
-def calculate_sell_via_site_topup(site_sell_price, quantity, sales_fee_percent,
-                                   withdrawal_fee_percent, withdrawal_fixed_fee,
-                                   deposit_profit_percent):
-    """Steam-баланс от продажи на сайте с последующим пополнением Steam (Режим 4).
-
-    Шаги:
-        gross_revenue = site_sell_price × quantity
-        after_sales   = gross × (1 − sales_fee_percent / 100)
-        real_money    = after_sales × (1 − withdrawal_fee_percent / 100) − withdrawal_fixed_fee
-        steam_balance = real_money × (1 + deposit_profit_percent / 100)
-
-    При deposit_profit_percent = 0 steam_balance равен real_money (пополнение 1:1).
-
-    Возвращает dict с ключами:
-        «gross»         — выручка до комиссий,
-        «real_money»    — реальные деньги после всех удержаний,
-        «steam_balance» — итоговый Steam-баланс.
-    """
-    site_sell_price = max(0.0, float(site_sell_price))
-    quantity = max(1, int(quantity))
-    sales_fee_percent = min(100.0, max(0.0, float(sales_fee_percent)))
-    withdrawal_fee_percent = min(100.0, max(0.0, float(withdrawal_fee_percent)))
-    withdrawal_fixed_fee = max(0.0, float(withdrawal_fixed_fee))
-
-    gross = site_sell_price * quantity
-    after_sales = gross * (1.0 - sales_fee_percent / 100.0)
-    after_withdrawal = after_sales * (1.0 - withdrawal_fee_percent / 100.0)
-    real_money = max(0.0, after_withdrawal - withdrawal_fixed_fee)
-
-    divisor = 1.0 + float(deposit_profit_percent) / 100.0
-    steam_balance = real_money * max(0.0, divisor)
-    return {"gross": gross, "real_money": real_money, "steam_balance": steam_balance}
-
-
-def calculate_steam_market_sell(steam_sell_price, quantity, total_steam_fee_percent,
-                                 currency_code):
-    """Steam-баланс от продажи на Steam Market напрямую (Режим 4).
-
-    Для целочисленных валют (UAH, JPY, …) применяется точная модель Valve:
-    round(10%)+round(5%) от суммы продавца с минимумом в одну единицу. Цена
-    buyer-side нормализуется округлением «half up» и прогоняется через
-    calculate_exact_steam_revenue, который и приводит её к ближайшей достижимой,
-    как реальная торговая площадка.
-
-    Для дробных валют используется расчёт в центах (floor-модель).
-
-    Возвращает dict:
-        «seller_per_unit» — продавцу за единицу;
-        «steam_balance»   — итого за всё количество;
-        «requested_unit»  — запрошенная цена (целое) — только для целочисленных валют;
-        «valid_buyer»     — ближайшая достижимая цена покупателя (целое) — то же.
-    Для дробных валют requested_unit / valid_buyer равны None.
-    """
-    steam_sell_price = max(0.0, float(steam_sell_price))
-    quantity = max(1, int(quantity))
-    total_steam_fee_percent = max(0.0, float(total_steam_fee_percent))
-    cs2_fee_pct, steam_fee_pct = _split_total_fee(total_steam_fee_percent)
-    int_ccy = is_integer_currency(currency_code)
-    requested_unit = valid_buyer = None
-    if int_ccy:
-        requested_unit = round_half_up_int(steam_sell_price)
-        seller_per_unit, buyer_unit, _, _ = calculate_exact_steam_revenue(
-            float(requested_unit), is_integer_currency=True,
-            cs2_fee_pct=cs2_fee_pct, steam_fee_pct=steam_fee_pct)
-        valid_buyer = int(round(buyer_unit))
-    else:
-        seller_per_unit = calculate_steam_received(steam_sell_price, total_steam_fee_percent)
-    return {"seller_per_unit": seller_per_unit, "steam_balance": seller_per_unit * quantity,
-            "requested_unit": requested_unit, "valid_buyer": valid_buyer}
-
-
-# ===========================================================================
-# РЕЖИМ 5: ЛУЧШЕЕ КАЧЕСТВО ДЛЯ ПОКУПКИ В КОЛЛЕКЦИИ
-# ===========================================================================
-
-# Качества CS2 по возрастанию редкости: (ключ перевода, цвет редкости).
-RARITY_DEFS = [
-    ("rarity_consumer",   "#b0c3d9"),
-    ("rarity_industrial", "#5e98d9"),
-    ("rarity_milspec",    "#4b69ff"),
-    ("rarity_restricted", "#8847ff"),
-    ("rarity_classified", "#d32ce6"),
-    ("rarity_covert",     "#eb4b4b"),
-]
-
-# Цвета рангов для подсветки (выше ранг — выгоднее покупка).
-RANK_COLORS = {
-    "A++": "#1a9850", "A+": "#52b04f", "A": "#86cb66",
-    "B": "#b8b8b8", "C": "#9e9e9e",
-    "D": "#f08a4b", "E": "#e2563b", "F": "#c0392b",
-}
-
-
-_RARITY_RANKS = ["F", "E", "D", "C", "B", "A", "A+", "A++"]  # индекс 0..7
-
-
-def _ratio_rank_index(ratio):
-    """Индекс ранга 0..6 (E..A++) по соотношению цен соседних качеств.
-
-    ratio — «во сколько раз дороже». Чем больше предметов нижнего качества по цене
-    эквивалентны одному верхнему, тем дешевле нижнее относительно того, во что оно
-    превращается контрактом 10->1, тем выгоднее покупка. Пороги заданы пользователем:
-        ≤2 → F, 2–3.5 → E, 3.5–4.5 → D, 4.5–5.5 → C (среднее), 5.5–6.5 → B,
-        6.5–8 → A, 8–10 → A+, >10 → A++.
-    Возвращает None при отсутствующем соотношении.
-    """
-    if ratio is None:
-        return None
-    if ratio <= 2.0:
-        return 0   # F  — сильно переоценено
-    if ratio <= 3.5:
-        return 1   # E  — переоценено
-    if ratio <= 4.5:
-        return 2   # D  — ниже среднего
-    if ratio <= 5.5:
-        return 3   # C  — среднее
-    if ratio <= 6.5:
-        return 4   # B
-    if ratio <= 8.0:
-        return 5   # A
-    if ratio <= 10.0:
-        return 6   # A+
-    return 7       # A++
-
-
-# Категория комментария по (ранг, роль). role: "lower" — обычное качество,
-# сравниваемое с тем, что выше; "highest" — высшее качество (наоборот).
-_RANK_COMMENT_KEYS = {
-    "lower":   {"F": "rk_over_strong", "E": "rk_over", "D": "rk_below", "C": "rk_normal",
-                "B": "rk_good", "A": "rk_under", "A+": "rk_under", "A++": "rk_under_susp"},
-    "highest": {"F": "rk_exp_strong", "E": "rk_exp", "D": "rk_exp_slight", "C": "rk_normal",
-                "B": "rk_good", "A": "rk_cheap", "A+": "rk_cheap", "A++": "rk_cheap_susp"},
-}
-
-# Порядок рангов для выбора лучшего (по убыванию привлекательности покупки).
-_RANK_ORDER = {"A++": 7, "A+": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1, "F": 0}
-
-
-def _positional_rank_adjustments(n):
-    """Корректировки РАНГА по позиции редкости среди присутствующих (снизу вверх).
-
-    Влияют ТОЛЬКО на ранг (как бонус красоты), не на сырые цифры/ratio/сравнения.
-    Знак: «+» = ранг лучше (реверс-логика высшего качества учитывает знак сама).
-        самый нижний грейд (idx 0): +0.25 (бонус, ВСЕГДА; штрафы его НЕ касаются)
-        лестница штрафов СВЕРХУ — только для грейдов ВЫШЕ самого нижнего (idx > 0):
-            самая высокая (idx n-1):           -0.50 (доп. штраф сверх реверс-штрафа)
-            предпоследняя (idx n-2):           -0.50
-            пред-предпоследняя (idx n-3):      -0.35
-            пред-пред-предпоследняя (idx n-4): -0.25
-    В маленькой коллекции штрафы НЕ «сползают» на нижние грейды: при n=2 штраф только
-    на самом верхнем, при n=3 — на двух верхних и т.д. (нижний грейд защищён). Если
-    позиция штрафа совпала бы с самым нижним грейдом (idx 0) — штраф не ставится.
-    Возвращает список длины n.
-    """
-    adj = [0.0] * n
-    if n <= 0:
-        return adj
-    adj[0] += 0.25  # самый нижний грейд — только бонус, штрафы его не трогают
-    # Лестница штрафов сверху; ставится лишь грейдам ВЫШЕ самого нижнего (idx > 0),
-    # поэтому в маленькой коллекции штрафы не доходят до низа.
-    for idx, penalty in ((n - 1, -0.50), (n - 2, -0.50), (n - 3, -0.35), (n - 4, -0.25)):
-        if idx > 0:
-            adj[idx] += penalty
-    return adj
-
-
-def analyze_collection_rarities(tiers):
-    """Считает соотношения и инвестиционные ранги для заполненных качеств коллекции.
-
-    tiers — список словарей {«key», «name», «color», «price», «beautiful»} ТОЛЬКО
-    для качеств с ценой > 0, по возрастанию редкости (нижнее первым). Возвращает
-    тот же список, обогащённый ключами «ratio» (базовое соотношение), «rank»,
-    «rank_index», «role» («lower»/«highest»).
-
-    Логика рангов:
-        * НЕ высшее качество: ratio = цена_выше / цена_этого (сколько штук этого по
-          цене = одно качество выше). Ранг — по _ratio_rank_index. Чем больше ratio,
-          тем выгоднее покупка нижнего качества.
-        * ВЫСШЕЕ качество (выше ничего нет): ранг считается «наоборот». ratio =
-          цена_высшего / цена_ниже; индекс реверсируется (7 - idx, т.е. F<->A++).
-          Затем штраф за инфляцию саплая (высшее нельзя скрафтить дальше, его
-          предложение только растёт): для итогового A и выше −2, для B/C/D/E −1.
-          Штраф берётся от БАЗОВОГО ratio (структурно), чтобы бонус красоты его
-          не гасил.
-        * Бонус «красоты/ликвидности»: если у качества включён флаг, к его ratio и к
-          ratio качества на 1 ниже прибавляется +0.5, на 2 ниже +0.25 (на 3 ниже —
-          ничего). На качество ВЫШЕ отмеченного бонус не влияет. Для высшего
-          качества бонус, наоборот, СНИЖАЕТ его ratio (улучшает реверс-ранг).
-    """
-    n = len(tiers)
-
-    # Накопление бонуса красоты по списку активных качеств (снизу вверх).
-    bonus = [0.0] * n
-    for i, t in enumerate(tiers):
-        if t.get("beautiful"):
-            bonus[i] += 0.5
-            if i - 1 >= 0:
-                bonus[i - 1] += 0.5
-            if i - 2 >= 0:
-                bonus[i - 2] += 0.25
-
-    # Позиционные корректировки РАНГА (только ранг, не сырые цифры/ratio): штрафы
-    # верхним редкостям и бонус самой нижней. Знак как у красоты: «+» = ранг лучше.
-    pos = _positional_rank_adjustments(n)
-    for i in range(n):
-        bonus[i] += pos[i]
-
-    results = []
-    for i, t in enumerate(tiers):
-        price = t["price"]
-        if i < n - 1:  # не высшее: сравниваем с тем, что выше
-            higher = tiers[i + 1]["price"]
-            base_ratio = (higher / price) if price > 0 else None
-            role = "lower"
-            idx = _ratio_rank_index(base_ratio + bonus[i]) if base_ratio is not None else None
-        else:  # высшее: наоборот + штраф за инфляцию саплая
-            role = "highest"
-            lower = tiers[i - 1]["price"] if n >= 2 else 0.0
-            if n >= 2 and lower > 0:
-                base_ratio = price / lower
-                reversed_base = 7 - _ratio_rank_index(base_ratio)
-                penalty = 2 if reversed_base >= 5 else 1   # A и выше -> -2, иначе -1
-                eff = max(0.0, base_ratio - bonus[i])      # красота снижает M -> лучше
-                reversed_eff = 7 - _ratio_rank_index(eff)
-                idx = max(0, min(7, reversed_eff - penalty))
+    # Если активен поиск/сортировка, на экране лишь срез базы. Чтобы проверка
+    # охватывала ВСЕ партии (а не только видимые), накладываем правки с экрана
+    # поверх полного списка: видимые строки берём из предпросмотра (по id), а
+    # скрытые — из полной базы как есть. Новые строки (без id) добавляем тоже.
+    if query:
+        visible_by_id = {d["id"]: d for d in preview_visible if "id" in d}
+        visible_ids = set(visible_by_id)
+        view_ids = {d.get("id") for d in view_deals}
+        check_deals = []
+        for d in deals:
+            did = d.get("id")
+            if did in visible_by_id:
+                check_deals.append(visible_by_id[did])      # правленая версия
+            elif did in view_ids and did not in visible_ids:
+                continue  # видимая строка была удалена на экране — пропускаем
             else:
-                base_ratio = None
-                idx = None
-        rank = _RARITY_RANKS[idx] if idx is not None else None
-        results.append({**t, "ratio": base_ratio, "rank": rank, "rank_index": idx, "role": role})
-    return results
-
-
-# ===========================================================================
-# РЕЖИМ 5 — ПРОДВИНУТЫЙ АНАЛИЗ ФЛОАТА (чистые функции, основа для продв. режима)
-# ===========================================================================
-# Структура данных (готова к расширению, см. план):
-#   record = {"wear": str|None, "exact_float": float|None, "price": float}
-#   skin   = {"name": str, "cap_lo": float, "cap_hi": float,
-#             "records": [record, ...], "agg_choice": int|None}
-#   rarity = {"key": ..., "skins": [skin, ...]}   # до 10 скинов на редкость
-# Резка скина [cap_lo, cap_hi] может быть нестандартной (например, перчатки 0.06–0.80).
-# Все расчёты ведутся в полном float64 (12+ значащих цифр сохраняются).
-
-# Степени износа CS2 и их границы по флоату. Сами флоаты 0.0 и 1.0 не существуют,
-# но как ГРАНИЦЫ полос и резки 0.0/1.0 допустимы (стандартный скин 0.00–1.00).
-WEAR_ORDER = ["FN", "MW", "FT", "WW", "BS"]
-WEAR_BANDS = {
-    "FN": (0.00, 0.07), "MW": (0.07, 0.15), "FT": (0.15, 0.38),
-    "WW": (0.38, 0.45), "BS": (0.45, 1.00),
-}
-FLOAT_EPS = 0.001  # отступ от верхней границы для дефолтного «худшего в качестве» флоата
-
-
-def wear_of_float(f):
-    """Степень износа (FN/MW/FT/WW/BS) по значению флоата."""
-    for name in WEAR_ORDER:
-        lo, hi = WEAR_BANDS[name]
-        if lo <= f < hi:
-            return name
-    return "BS" if f >= 0.45 else None
-
-
-def wears_intersecting_cap(cap_lo, cap_hi):
-    """Список степеней износа, чьи диапазоны пересекаются с резкой скина."""
-    out = []
-    for name in WEAR_ORDER:
-        wl, wh = WEAR_BANDS[name]
-        if max(wl, cap_lo) < min(wh, cap_hi):
-            out.append(name)
-    return out
-
-
-def default_float_for_wear(wear, cap_lo, cap_hi, midpoint=False, eps=FLOAT_EPS):
-    """Дефолтный флоат записи, у которой указано только качество (без точного флоата).
-
-    По умолчанию — ВЕРХ пересечения (качество ∩ резка) − ε («худший в качестве»):
-    для стандартной резки 0–1 это FN 0.069, MW 0.149, FT 0.379, WW 0.449, BS 0.999.
-    midpoint=True — СЕРЕДИНА пересечения (например, для FT с резкой 0.25–0.75 это
-    середина [0.25; 0.38)). Возвращает None, если качество не пересекает резку.
-    """
-    wl, wh = WEAR_BANDS[wear]
-    lo, hi = max(wl, cap_lo), min(wh, cap_hi)
-    if lo >= hi:
-        return None
-    if midpoint:
-        return (lo + hi) / 2.0
-    cand = hi - eps
-    return cand if cand > lo else (lo + hi) / 2.0
-
-
-def contract_weight(f, cap_lo, cap_hi):
-    """Вес флоата в контракте: w = (f − cap_lo) / (cap_hi − cap_lo), зажат в [0, 1].
-
-    Скин с нестандартной резкой «растягивается» к стандартному 0–1: например,
-    Savannah Halftone FT 0.265 (резка 0.25–0.75) даёт w = 0.03 (в контракте — почти FN).
-    Возвращает None при некорректной резке (span ≤ 0).
-    """
-    span = cap_hi - cap_lo
-    if span <= 0:
-        return None
-    return min(1.0, max(0.0, (f - cap_lo) / span))
-
-
-def validate_cap(cap_lo, cap_hi):
-    """Проверка резки. Границы 0.0 и 1.0 допустимы (стандартный скин 0.00–1.00);
-    несуществование флоатов 0.0/1.0 — ограничение на ФЛОАТ, а не на резку."""
-    if cap_lo is None or cap_hi is None or not (0.0 <= cap_lo < cap_hi <= 1.0):
-        return ["cap: требуется 0 <= min < max <= 1"]
-    return []
-
-
-def record_effective_float(rec, cap_lo, cap_hi, midpoint=False):
-    """Эффективный флоат записи: точный, если указан; иначе дефолт по качеству."""
-    if rec.get("exact_float") is not None:
-        return rec["exact_float"]
-    if rec.get("wear"):
-        return default_float_for_wear(rec["wear"], cap_lo, cap_hi, midpoint)
-    return None
-
-
-def validate_record(rec, cap_lo, cap_hi):
-    """Валидация записи в контексте резки скина. Возвращает список ошибок (пуст — ок).
-
-    Правила: цена > 0; указано качество ИЛИ точный флоат; если резка валидна —
-    точный флоат внутри резки И внутри указанного качества; выбранное качество
-    пересекается с резкой (FN невозможен при резке от 0.25).
-    """
-    errs = []
-    cap_errs = validate_cap(cap_lo, cap_hi)
-    errs += cap_errs
-    price = rec.get("price")
-    if price is None or price <= 0:
-        errs.append("цена должна быть > 0")
-    wear = rec.get("wear")
-    ef = rec.get("exact_float")
-    if wear is None and ef is None:
-        errs.append("укажите качество или точный флоат")
-    if not cap_errs:
-        if wear is not None and wear not in wears_intersecting_cap(cap_lo, cap_hi):
-            errs.append(f"качество {wear} не пересекается с резкой [{cap_lo}; {cap_hi})")
-        if ef is not None:
-            if not (cap_lo <= ef < cap_hi):
-                errs.append(f"точный флоат {ef:.12f} вне резки [{cap_lo}; {cap_hi})")
-            elif wear is not None:
-                wl, wh = WEAR_BANDS[wear]
-                if not (wl <= ef < wh):
-                    errs.append(f"точный флоат {ef:.12f} вне качества {wear}")
-    return errs
-
-
-def record_metrics(rec, cap_lo, cap_hi, midpoint=False):
-    """Показатели валидной записи: eff_float, w (вес в контракте), q (чистота = 1−w),
-    price. None — если запись невалидна. Метрики «ценности» (наценка за чистоту, балл)
-    считаются на уровне скина/редкости, где есть с чем сравнивать."""
-    if validate_record(rec, cap_lo, cap_hi):
-        return None
-    f = record_effective_float(rec, cap_lo, cap_hi, midpoint)
-    if f is None:
-        return None
-    w = contract_weight(f, cap_lo, cap_hi)
-    return {"eff_float": f, "w": w,
-            "q": (1.0 - w) if w is not None else None,
-            "price": float(rec["price"])}
-
-
-def skin_records_metrics(skin, midpoint=False):
-    """Метрики по каждой валидной записи скина (основа для сравнения качеств внутри скина)."""
-    cap_lo, cap_hi = skin["cap_lo"], skin["cap_hi"]
-    out = []
-    for i, rec in enumerate(skin.get("records", [])):
-        m = record_metrics(rec, cap_lo, cap_hi, midpoint)
-        if m is not None:
-            out.append({"index": i, **m})
-    return out
-
-
-def skin_premium_table(skin, midpoint=False):
-    """Наценка за чистоту ВНУТРИ скина — основная метрика флоат-ценности.
-
-    Пол — самая дешёвая валидная запись скина (при равной цене — самая чистая); это
-    цена без наценки за флоат. Для каждой записи ЧИЩЕ пола:
-        наценка = (Цена − Цена_пола) / (Чистота − Чистота_пола)   [$ за ед. чистоты]
-    Здесь нет деления на (1−w), поэтому метрика не взрывается ни при грязи (w→1), ни
-    при любой цене. Ниже наценка — дешевле чистота — меньше переплата за флоат.
-
-    Статусы записей: 'floor' (пол), 'premium' (чище пола, есть наценка),
-    'dominated' (дороже пола и не чище — невыгодно). best_premium — минимальная наценка
-    среди 'premium'-записей (лучшая сделка по чистоте у этого скина); None, если записей
-    меньше двух ИЛИ ни одна не чище пола (например, самый дешёвый уже самый чистый).
-    Возвращает dict или None (нет валидных записей).
-    """
-    ms = skin_records_metrics(skin, midpoint)
-    if not ms:
-        return None
-    floor = min(ms, key=lambda m: (m["price"], m["w"]))  # дешевле, при равенстве — чище
-    p0, q0 = floor["price"], floor["q"]
-    recs, best, best_i, cleaner_exists = [], None, None, False
-    for m in ms:
-        if m["index"] == floor["index"]:
-            recs.append({**m, "premium": None, "status": "floor"})
-            continue
-        dq = m["q"] - q0
-        if dq > 1e-9:  # чище пола
-            cleaner_exists = True
-            prem = (m["price"] - p0) / dq
-            recs.append({**m, "premium": prem, "status": "premium"})
-            if best is None or prem < best:
-                best, best_i = prem, m["index"]
-        else:  # не чище, но не дешевле пола — доминируется
-            recs.append({**m, "premium": None, "status": "dominated"})
-    return {"floor_index": floor["index"], "records": recs, "best_premium": best,
-            "best_index": best_i, "n_records": len(ms), "cleaner_exists": cleaner_exists}
-
-
-def rarity_float_summary(skins, midpoint=False):
-    """Сводка наценки за чистоту по редкости (на основе наценок внутри скинов).
-
-    best_premium — минимальная наценка за чистоту среди всех скинов (самая дешёвая
-    чистота в редкости); avg_premium — среднее лучших наценок по скинам, у которых
-    наценку вообще можно посчитать (≥2 флоата и есть запись чище пола). n_with_premium —
-    сколько скинов попало в расчёт. Скины с одной записью в наценку не входят.
-    """
-    per_skin_best, overall_best, overall_best_skin = [], None, None
-    for skin in skins:
-        t = skin_premium_table(skin, midpoint)
-        if t and t["best_premium"] is not None:
-            per_skin_best.append(t["best_premium"])
-            if overall_best is None or t["best_premium"] < overall_best:
-                overall_best, overall_best_skin = t["best_premium"], skin.get("name", "?")
-    if not per_skin_best:
-        return {"best_premium": None, "avg_premium": None,
-                "best_skin": None, "n_with_premium": 0}
-    return {"best_premium": overall_best,
-            "avg_premium": sum(per_skin_best) / len(per_skin_best),
-            "best_skin": overall_best_skin, "n_with_premium": len(per_skin_best)}
-
-
-def float_value_scores(records_metrics, alpha=0.5):
-    """ЭКСПЕРИМЕНТАЛЬНЫЙ балл флоат-ценности 0–100 внутри набора записей.
-
-    Сводит чистоту q (уже [0,1]) и дешевизну (нормированную min-max цену в наборе) в
-    один балл: score = 100·(α·q + (1−α)·дешевизна). Выше = чище и дешевле. Балл
-    ОТНОСИТЕЛЕН набору (меняется при добавлении записей) и зависит от веса α (по
-    умолчанию 0.5/0.5) — поэтому он вспомогательный, а основная метрика — наценка за
-    чистоту. Возвращает тот же список со старыми полями плюс 'score'.
-    """
-    if not records_metrics:
-        return []
-    prices = [m["price"] for m in records_metrics]
-    p_min, p_max = min(prices), max(prices)
-    out = []
-    for m in records_metrics:
-        cheap = 1.0 - ((m["price"] - p_min) / (p_max - p_min)) if p_max > p_min else 1.0
-        out.append({**m, "score": 100.0 * (alpha * m["q"] + (1.0 - alpha) * cheap)})
-    return out
-
-
-# ===========================================================================
-# РЕЖИМ 5 — ДВИЖОК КОНТРАКТОВ 10→1 (чистые функции)
-# ===========================================================================
-# Модель контракта обмена: 10 входов редкости R -> 1 выход редкости R+1.
-# Выходной флоат: f_out = a_out + W̄·(b_out − a_out), где W̄ — контрактный вес входов.
-# Исход — равновероятный по всем выходным скинам коллекции (1 скин = 1 исход).
-
-def contract_output_float(W_bar, out_cap_lo, out_cap_hi):
-    """Выходной флоат контракта: f_out = a + W̄·(b − a). W̄ — средняя чистота входов."""
-    return out_cap_lo + W_bar * (out_cap_hi - out_cap_lo)
-
-
-def _price_by_wear_map(skin, midpoint=False):
-    """{качество: минимальная цена среди валидных записей скина в этом качестве}."""
-    m = {}
-    for rec in skin.get("records", []):
-        rm = record_metrics(rec, skin["cap_lo"], skin["cap_hi"], midpoint)
-        if rm is None:
-            continue
-        wear = wear_of_float(rm["eff_float"])
-        if wear is None:
-            continue
-        if wear not in m or rec["price"] < m[wear]:
-            m[wear] = rec["price"]
-    return m
-
-
-def skin_price_at_wear(skin, target_wear, midpoint=False):
-    """Цена скина в заданном качестве; если записи нет — ближайшее качество по индексу
-    (оценка). None, если у скина нет валидных записей."""
-    m = _price_by_wear_map(skin, midpoint)
-    if not m:
-        return None
-    if target_wear in m:
-        return m[target_wear]
-    ti = WEAR_ORDER.index(target_wear)
-    nearest = min(m.keys(), key=lambda w: abs(WEAR_ORDER.index(w) - ti))
-    return m[nearest]
-
-
-def expected_output_value(W_bar, output_skins, midpoint=False):
-    """E(выход, W̄) — средняя цена по выходным скинам на полученном флоате
-    (равновероятный исход контракта одной коллекции). None, если данных нет."""
-    vals = []
-    for s in output_skins:
-        f = contract_output_float(W_bar, s["cap_lo"], s["cap_hi"])
-        wear = wear_of_float(f)
-        if wear is None:
-            continue
-        p = skin_price_at_wear(s, wear, midpoint)
-        if p is not None:
-            vals.append(p)
-    if not vals:
-        return None
-    return sum(vals) / len(vals)
-
-
-def _filler_candidate_records(filler_skins, midpoint=False):
-    """Все валидные записи редкости как кандидаты-филлеры контракта.
-
-    Возвращает список {skin, wear, f, w, price}: подпись скина (имя или #номер),
-    качество (введённое или по флоату), эффективный флоат, контрактный вес w и цена.
-    """
-    cands = []
-    for si, sk in enumerate(filler_skins):
-        label = (sk.get("name") or "").strip() or f"#{si + 1}"
-        for rec in sk.get("records", []):
-            rm = record_metrics(rec, sk["cap_lo"], sk["cap_hi"], midpoint)
-            if rm is None or rm["w"] is None:
-                continue
-            cands.append({
-                "skin": label,
-                "wear": rec.get("wear") or wear_of_float(rm["eff_float"]) or "?",
-                "f": rm["eff_float"], "w": rm["w"], "price": rm["price"],
-            })
-    return cands
-
-
-def tradeup_candidates(filler_skins, output_skins, midpoint=False, n=10):
-    """ВСЕ кандидаты-филлеры редкости с полной экономикой контракта R→R+1.
-
-    Для каждой валидной записи: контракт из n её копий (W̄ = её контрактный вес w),
-    затраты = n × цена, ожидаемый выход = среднее по ВСЕМ скинам следующей редкости,
-    оценённым на флоате, который даст контракт (1 скин = 1 равновероятный исход).
-
-    ДВА показателя доходности (чтобы не путать их между собой):
-        net_roi  — чистая доходность = (выход − затраты)/затраты. 0 = в ноль,
-                   +0.05 = +5% прибыли, отрицательное = убыток. На ней построены
-                   пороги (флоат-бонус, вердикт «убыточен») — так удобнее считать.
-        roi_full — ПОЛНЫЙ возврат = выход/затраты = 1 + net_roi. 1.0 (100%) = вернул
-                   вложенное, 1.05 (105%) = +5% прибыли. Это то, что показывается
-                   в интерфейсе, чтобы «105%» нельзя было прочитать как «+105%».
-
-    Единый источник математики: этим пользуются и выбор филлера (best_tradeup_roi),
-    и таблица «что покупать» в интерфейсе — расчёты не могут разойтись.
-    Возвращает список {skin, wear, f, w, price, cost, E_out, net_roi, roi_full}.
-    """
-    if not output_skins:
-        return []
-    out = []
-    for c in _filler_candidate_records(filler_skins, midpoint):
-        e = expected_output_value(c["w"], output_skins, midpoint)
-        cost = n * c["price"]
-        if e is None or cost <= 0:
-            continue
-        out.append({**c, "cost": cost, "E_out": e,
-                    "net_roi": (e - cost) / cost, "roi_full": e / cost})
-    return out
-
-
-def sort_tradeup_candidates(cands, contract_mode="cheapest"):
-    """Порядок кандидатов под выбранный режим (первый = тот, который берёт контракт).
-
-        'cheapest' — сначала самые дешёвые (при равной цене — более чистый);
-        'best'     — сначала лучшая доходность (при равной — дешевле, затем чище).
-    Порядок по net_roi и по roi_full одинаков (roi_full = 1 + net_roi), сортируем по net_roi.
-    """
-    if contract_mode == "best":
-        return sorted(cands, key=lambda c: (-c["net_roi"], c["cost"], c["w"]))
-    return sorted(cands, key=lambda c: (c["price"], c["w"]))
-
-
-def best_tradeup_roi(filler_skins, output_skins, midpoint=False, n=10,
-                     contract_mode="cheapest"):
-    """Контракт R→R+1 на РЕАЛЬНЫХ записях (без интерполяции гипотетических филлеров).
-
-    Кандидат-филлер = валидная запись редкости; контракт = n её копий (см.
-    tradeup_candidates). contract_mode:
-        'cheapest' — филлер = САМАЯ ДЕШЁВАЯ запись (её реальный флоат; при равной
-                     цене берётся более чистая);
-        'best'     — перебираются ВСЕ записи, берётся филлер с ЛУЧШЕЙ доходностью
-                     (лучшее соотношение цена/качество для крафта-закупки).
-
-    Возвращает {net_roi, roi_full, W_star, E_out, cost, filler, n_candidates,
-    overpay_clean} или None (нет валидных данных). net_roi — чистая доходность
-    (0 = в ноль), roi_full — полный возврат (1.0 = 100% = в ноль); см. tradeup_candidates.
-    filler = {skin, wear, f, price}. overpay_clean:
-        'worth'        — (только 'best') лучший филлер дороже самого дешёвого, но его
-                         доходность выше: доплата за чистоту окупается,
-        'avoid'        — (только 'best') самый дешёвый филлер и есть лучший:
-                         за чистоту не переплачивать,
-        'unprofitable' — net_roi ≤ 0, т.е. возврат ≤ 100% (крафт убыточен),
-        None           — режим 'cheapest' при net_roi > 0 (чистоту не сравнивали).
-    """
-    cands = tradeup_candidates(filler_skins, output_skins, midpoint, n)
-    if not cands:
-        return None
-    cheapest = sort_tradeup_candidates(cands, "cheapest")[0]
-    chosen = sort_tradeup_candidates(cands, contract_mode)[0]
-    best = {
-        "net_roi": chosen["net_roi"], "roi_full": chosen["roi_full"],
-        "W_star": chosen["w"], "E_out": chosen["E_out"],
-        "cost": chosen["cost"], "n_candidates": len(cands),
-        "filler": {"skin": chosen["skin"], "wear": chosen["wear"],
-                   "f": chosen["f"], "price": chosen["price"]},
-    }
-    if best["net_roi"] <= 0:
-        best["overpay_clean"] = "unprofitable"
-    elif contract_mode != "best":
-        best["overpay_clean"] = None  # в режиме «по самым дешёвым» чистоту не сравниваем
-    elif chosen["net_roi"] > cheapest["net_roi"] + 1e-12:
-        best["overpay_clean"] = "worth"
+                check_deals.append(d)                        # скрытая строка как есть
+        check_deals.extend(d for d in preview_visible if "id" not in d)  # новые строки
     else:
-        best["overpay_clean"] = "avoid"
-    return best
+        check_deals = preview_visible
 
-
-def tradeup_float_bonus(net_roi, cap=2.0, max_bonus=1.0):
-    """Флоат-бонус к ratio из ЧИСТОЙ доходности контракта (ограниченный, как бонус красоты).
-
-    Считается на net_roi (0 = в ноль), а не на полном возврате: net_roi ≤ 0 → бонуса нет
-    (убыточный контракт ранг не поднимает); net_roi ≥ cap → max_bonus; между — линейно.
-    cap = 2.0 ⇒ чистая доходность +200% (полный возврат 300%) даёт максимальный бонус.
-    """
-    if net_roi is None or net_roi <= 0:
-        return 0.0
-    return min(max_bonus, (net_roi / cap) * max_bonus)
-
-
-def rarity_representative_price(skins, midpoint=False):
-    """Цена редкости для ценового ранга = САМАЯ ДЕШЁВАЯ валидная запись в редкости.
-
-    Это цена, по которой реально набираешь филлеры для контракта; в контракт идут
-    самые дешёвые скины, а не «средний» скин, поэтому берётся минимум по всем
-    валидным записям всех скинов редкости (не среднее). None, если валидных нет."""
-    prices = []
-    for skin in skins:
-        for rec in skin.get("records", []):
-            if record_metrics(rec, skin["cap_lo"], skin["cap_hi"], midpoint) is not None:
-                prices.append(rec["price"])
-    if not prices:
-        return None
-    return min(prices)
-
-
-def analyze_collection_advanced(rarity_data, midpoint=False, contract_mode="cheapest"):
-    """Ранжирование редкостей в продвинутом режиме (с учётом резки и флоат-экономики).
-
-    rarity_data — список (key, skins) ПО ВОЗРАСТАНИЮ редкости. Учитываются редкости,
-    у которых есть хотя бы один валидный скин с ценой. Логика ценового ранга та же,
-    что в простом режиме (ratio соседних цен, реверс+штраф для высшего), НО к ratio
-    нижних редкостей добавляется флоат-бонус из чистой доходности контракта R→R+1 на
-    РЕАЛЬНЫХ записях (best_tradeup_roi; contract_mode: 'cheapest' — самая дешёвая запись,
-    'best' — запись с лучшей доходностью). Высшее качество флоат-бонус не получает
-    (из него не крафтят).
-
-    Возвращает список dict: key, price, ratio, rank, rank_index, role, float_bonus,
-    net_roi (чистая доходность, 0 = в ноль), roi_full (полный возврат, 1.0 = 100% = в ноль),
-    W_star, E_out, cost, filler, n_candidates, candidates (все филлеры в порядке выбранного
-    режима: первый = взятый контрактом), verdict (overpay_clean),
-    float_summary (наценка за чистоту по редкости).
-    """
-    active = []
-    for key, skins in rarity_data:
-        price = rarity_representative_price(skins, midpoint)
-        if price is not None and price > 0:
-            active.append({"key": key, "skins": skins, "price": price})
-    if len(active) < 2:
-        return []
-    n = len(active)
-    # Позиционные корректировки РАНГА (только ранг, не сырые цифры): как в простом
-    # режиме. «+» = ранг лучше; штрафы верхним редкостям, бонус самой нижней.
-    pos = _positional_rank_adjustments(n)
-    results = []
-    for i, rar in enumerate(active):
-        price = rar["price"]
-        float_bonus, verdict, roi_info, cands = 0.0, None, None, []
-        if i < n - 1:  # не высшее: возможен контракт R -> R+1
-            roi_info = best_tradeup_roi(rar["skins"], active[i + 1]["skins"], midpoint,
-                                        contract_mode=contract_mode)
-            # Полный список кандидатов-филлеров в порядке выбранного режима:
-            # первый = тот, который берёт контракт (та же математика и те же тай-брейки).
-            cands = sort_tradeup_candidates(
-                tradeup_candidates(rar["skins"], active[i + 1]["skins"], midpoint),
-                contract_mode)
-            if roi_info:
-                float_bonus = tradeup_float_bonus(roi_info["net_roi"])
-                verdict = roi_info["overpay_clean"]
-            base_ratio = active[i + 1]["price"] / price
-            idx = _ratio_rank_index(base_ratio + float_bonus + pos[i])
-            role = "lower"
-        else:  # высшее: реверс + штраф (+ позиционный штраф), без флоат-бонуса
-            base_ratio = price / active[i - 1]["price"]
-            reversed_base = 7 - _ratio_rank_index(base_ratio)
-            penalty = 2 if reversed_base >= 5 else 1
-            eff = max(0.0, base_ratio - pos[i])   # pos[i] (<0 у высшего) -> eff больше -> хуже
-            reversed_eff = 7 - _ratio_rank_index(eff)
-            idx = max(0, min(7, reversed_eff - penalty))
-            role = "highest"
-        results.append({
-            "key": rar["key"], "price": price, "ratio": base_ratio,
-            "rank": _RARITY_RANKS[idx], "rank_index": idx, "role": role,
-            "float_bonus": float_bonus,
-            "net_roi": (roi_info["net_roi"] if roi_info else None),
-            "roi_full": (roi_info["roi_full"] if roi_info else None),
-            "W_star": (roi_info["W_star"] if roi_info else None),
-            "E_out": (roi_info["E_out"] if roi_info else None),
-            "cost": (roi_info["cost"] if roi_info else None),
-            "filler": (roi_info["filler"] if roi_info else None),
-            "n_candidates": (roi_info["n_candidates"] if roi_info else None),
-            "candidates": cands,
-            "verdict": verdict,
-            "float_summary": rarity_float_summary(rar["skins"], midpoint),
-        })
-    return results
-
-
-# ===========================================================================
-# ШАБЛОНЫ СУЩЕСТВУЮЩИХ КОЛЛЕКЦИЙ (для продвинутого режима)
-# Данные статичны (зашиты в коде): названия/резки/качества/флоаты неизменны,
-# со временем меняются только цены — пользователь правит их сам после загрузки.
-# Внешнего ввода (файлы/сеть) нет — источник уязвимостей отсутствует.
-# ФЛОАТЫ: если указан exact_float — берётся он (точнее для контрактов); None —
-# качество без точного флоата (калькулятор возьмёт «худший в качестве»/середину).
-# ===========================================================================
-COLLECTION_TEMPLATES = {
-    "cobblestone": {
-        "name": "Cobblestone",
-        "data": {
-            "rarity_covert": [
-                {"name": "AWP | Dragon Lore", "cap_lo": 0.00, "cap_hi": 0.70, "records": [
-                    {"wear": "FN", "exact_float": 0.0646, "price": 11172.0},
-                    {"wear": "MW", "exact_float": 0.0941, "price": 8300.0},
-                    {"wear": "FT", "exact_float": 0.288, "price": 6140.0},
-                    {"wear": "WW", "exact_float": 0.446, "price": 5318.0},
-                    {"wear": "BS", "exact_float": 0.518, "price": 4549.0},
-                ]},
-            ],
-            "rarity_classified": [
-                {"name": "M4A1-S | Knight", "cap_lo": 0.00, "cap_hi": 0.10, "records": [
-                    {"wear": "FN", "exact_float": 0.034, "price": 2360.0},
-                    {"wear": "MW", "exact_float": None, "price": 2185.0},
-                ]},
-            ],
-            "rarity_restricted": [
-                {"name": "Desert Eagle | Hand Cannon", "cap_lo": 0.01, "cap_hi": 0.70, "records": [
-                    {"wear": "FN", "exact_float": 0.056, "price": 441.0},
-                    {"wear": "MW", "exact_float": 0.084, "price": 301.0},
-                    {"wear": "FT", "exact_float": 0.304, "price": 276.0},
-                    {"wear": "WW", "exact_float": 0.407, "price": 350.0},
-                    {"wear": "BS", "exact_float": 0.627, "price": 302.0},
-                ]},
-                {"name": "CZ75-Auto | Chalice", "cap_lo": 0.00, "cap_hi": 0.10, "records": [
-                    {"wear": "FN", "exact_float": 0.041, "price": 280.0},
-                    {"wear": "MW", "exact_float": 0.071, "price": 279.0},
-                ]},
-            ],
-            "rarity_milspec": [
-                {"name": "P2000 | Chainmail", "cap_lo": 0.00, "cap_hi": 0.22, "records": [
-                    {"wear": "FN", "exact_float": 0.0267, "price": 45.73},
-                    {"wear": "MW", "exact_float": 0.086, "price": 40.0},
-                    {"wear": "FT", "exact_float": 0.163, "price": 38.0},
-                ]},
-                {"name": "MP9 | Dark Age", "cap_lo": 0.00, "cap_hi": 0.22, "records": [
-                    {"wear": "FN", "exact_float": 0.0275, "price": 55.4},
-                    {"wear": "MW", "exact_float": 0.089, "price": 42.5},
-                    {"wear": "FT", "exact_float": 0.206, "price": 40.25},
-                ]},
-            ],
-            "rarity_industrial": [
-                {"name": "USP-S | Royal Blue", "cap_lo": 0.06, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.0697, "price": 117.0},
-                    {"wear": "MW", "exact_float": 0.130, "price": 37.0},
-                    {"wear": "FT", "exact_float": 0.378, "price": 8.87},
-                    {"wear": "WW", "exact_float": 0.386, "price": 9.8},
-                    {"wear": "BS", "exact_float": 0.521, "price": 8.73},
-                ]},
-                {"name": "MAG-7 | Silver", "cap_lo": 0.00, "cap_hi": 0.08, "records": [
-                    {"wear": "FN", "exact_float": 0.0255, "price": 16.0},
-                    {"wear": "MW", "exact_float": 0.074, "price": 20.0},
-                ]},
-                {"name": "Nova | Green Apple", "cap_lo": 0.00, "cap_hi": 0.30, "records": [
-                    {"wear": "FN", "exact_float": 0.056, "price": 9.13},
-                    {"wear": "MW", "exact_float": 0.129, "price": 8.0},
-                    {"wear": "FT", "exact_float": 0.243, "price": 8.0},
-                ]},
-                {"name": "Sawed-Off | Rust Coat", "cap_lo": 0.00, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.018, "price": 17.5},
-                    {"wear": "MW", "exact_float": 0.134, "price": 7.5},
-                    {"wear": "FT", "exact_float": 0.257, "price": 6.2},
-                    {"wear": "WW", "exact_float": 0.4, "price": 12.0},
-                    {"wear": "BS", "exact_float": 0.491, "price": 6.16},
-                ]},
-            ],
-            "rarity_consumer": [
-                {"name": "MAC-10 | Indigo", "cap_lo": 0.06, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.065, "price": 28.4},
-                    {"wear": "MW", "exact_float": 0.128, "price": 4.18},
-                    {"wear": "FT", "exact_float": 0.353, "price": 1.91},
-                    {"wear": "WW", "exact_float": 0.4, "price": 1.6},
-                    {"wear": "BS", "exact_float": 0.76, "price": 1.5},
-                ]},
-                {"name": "P90 | Storm", "cap_lo": 0.06, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.0652, "price": 23.42},
-                    {"wear": "MW", "exact_float": 0.140, "price": 3.2},
-                    {"wear": "FT", "exact_float": 0.274, "price": 1.84},
-                    {"wear": "WW", "exact_float": 0.4, "price": 1.84},
-                    {"wear": "BS", "exact_float": None, "price": 1.6},
-                ]},
-                {"name": "UMP-45 | Indigo", "cap_lo": 0.06, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.065, "price": 17.0},
-                    {"wear": "MW", "exact_float": 0.124, "price": 3.12},
-                    {"wear": "FT", "exact_float": 0.23, "price": 2.0},
-                    {"wear": "WW", "exact_float": None, "price": 1.8},
-                    {"wear": "BS", "exact_float": None, "price": 2.0},
-                ]},
-                {"name": "Dual Berettas | Briar", "cap_lo": 0.00, "cap_hi": 0.22, "records": [
-                    {"wear": "FN", "exact_float": 0.0446, "price": 3.7},
-                    {"wear": "MW", "exact_float": 0.0879, "price": 2.2},
-                    {"wear": "FT", "exact_float": 0.188, "price": 2.22},
-                ]},
-                {"name": "SCAR-20 | Storm", "cap_lo": 0.06, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.069, "price": 14.37},
-                    {"wear": "MW", "exact_float": 0.124, "price": 3.3},
-                    {"wear": "FT", "exact_float": 0.339, "price": 1.8},
-                    {"wear": "WW", "exact_float": 0.38, "price": 2.0},
-                    {"wear": "BS", "exact_float": 0.57, "price": 1.7},
-                ]},
-            ],
-        },
-    },
-    "overpass_2024": {
-        "name": "Overpass 2024",
-        "data": {
-            "rarity_covert": [
-                {"name": "AK-47 | B the Monster", "cap_lo": 0.00, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.0698, "price": 518.65},
-                    {"wear": "MW", "exact_float": 0.14533, "price": 210.36},
-                    {"wear": "FT", "exact_float": 0.3516491, "price": 120.80},
-                    {"wear": "WW", "exact_float": 0.44308909, "price": 104.72},
-                    {"wear": "BS", "exact_float": 0.65594, "price": 67.81},
-                ]},
-            ],
-            "rarity_classified": [
-                {"name": "AWP | Crakow!", "cap_lo": 0.00, "cap_hi": 1.00, "records": [
-                    {"wear": "FN", "exact_float": 0.069545, "price": 115.91},
-                    {"wear": "MW", "exact_float": 0.14996999, "price": 52.32},
-                    {"wear": "FT", "exact_float": 0.3508890, "price": 25.50},
-                    {"wear": "WW", "exact_float": 0.44785550, "price": 19.81},
-                    {"wear": "BS", "exact_float": 0.55, "price": 18.26},
-                ]},
-                {"name": "Zeus x27 | Dragon Snore", "cap_lo": 0.00, "cap_hi": 0.80, "records": [
-                    {"wear": "FN", "exact_float": 0.06850666, "price": 56.97},
-                    {"wear": "MW", "exact_float": 0.14625713, "price": 30.12},
-                    {"wear": "FT", "exact_float": 0.293806, "price": 14.60},
-                    {"wear": "WW", "exact_float": 0.441100, "price": 11.96},
-                    {"wear": "BS", "exact_float": 0.684881, "price": 11.06},
-                ]},
-            ],
-            "rarity_restricted": [
-                {"name": "AUG | Eye of Zapems", "cap_lo": 0.00, "cap_hi": 0.85, "records": [
-                    {"wear": "FN", "exact_float": 0.06980744, "price": 12.58},
-                    {"wear": "MW", "exact_float": 0.12237, "price": 4.69},
-                    {"wear": "FT", "exact_float": 0.366743, "price": 2.03},
-                    {"wear": "WW", "exact_float": 0.395760, "price": 2.10},
-                    {"wear": "BS", "exact_float": 0.542031, "price": 1.55},
-                ]},
-                {"name": "Dual Berettas | Sweet Little Angels", "cap_lo": 0.00, "cap_hi": 0.82, "records": [
-                    {"wear": "FN", "exact_float": 0.067218, "price": 11.44},
-                    {"wear": "MW", "exact_float": 0.118830, "price": 4.81},
-                    {"wear": "FT", "exact_float": 0.3241175, "price": 2.14},
-                    {"wear": "WW", "exact_float": 0.436387, "price": 1.92},
-                    {"wear": "BS", "exact_float": 0.757794797421, "price": 1.68},
-                ]},
-                {"name": "XM1014 | Monster Melt", "cap_lo": 0.00, "cap_hi": 0.75, "records": [
-                    {"wear": "FN", "exact_float": 0.065963, "price": 9.26},
-                    {"wear": "MW", "exact_float": 0.132945328, "price": 4.30},
-                    {"wear": "FT", "exact_float": 0.3212739, "price": 2.07},
-                    {"wear": "WW", "exact_float": 0.411673, "price": 2.03},
-                    {"wear": "BS", "exact_float": 0.57791, "price": 1.50},
-                ]},
-            ],
-            "rarity_milspec": [
-                {"name": "MAC-10 | Pipsqueak", "cap_lo": 0.00, "cap_hi": 0.90, "records": [
-                    {"wear": "FN", "exact_float": 0.058604, "price": 3.69},
-                    {"wear": "MW", "exact_float": 0.1132334, "price": 0.80},
-                    {"wear": "FT", "exact_float": 0.3575538, "price": 0.25},
-                    {"wear": "WW", "exact_float": 0.426355, "price": 0.23},
-                    {"wear": "BS", "exact_float": 0.840270638, "price": 0.18},
-                ]},
-                {"name": "Galil AR | Metallic Squeezer", "cap_lo": 0.00, "cap_hi": 0.60, "records": [
-                    {"wear": "FN", "exact_float": 0.05666, "price": 1.23},
-                    {"wear": "MW", "exact_float": 0.141441, "price": 0.37},
-                    {"wear": "FT", "exact_float": 0.23418, "price": 0.19},
-                    {"wear": "WW", "exact_float": 0.444086, "price": 0.17},
-                    {"wear": "BS", "exact_float": 0.557496, "price": 0.17},
-                ]},
-                {"name": "Nova | Wurst H\u00f6lle", "cap_lo": 0.00, "cap_hi": 1.00, "records": [
-                    {"wear": "FN", "exact_float": 0.0675576, "price": 2.36},
-                    {"wear": "MW", "exact_float": 0.13355, "price": 0.51},
-                    {"wear": "FT", "exact_float": 0.36028, "price": 0.24},
-                    {"wear": "WW", "exact_float": 0.386, "price": 0.21},
-                    {"wear": "BS", "exact_float": 0.8996814, "price": 0.18},
-                ]},
-                {"name": "Glock-18 | Teal Graf", "cap_lo": 0.00, "cap_hi": 0.50, "records": [
-                    {"wear": "FN", "exact_float": 0.06567, "price": 1.05},
-                    {"wear": "MW", "exact_float": 0.147716611, "price": 0.31},
-                    {"wear": "FT", "exact_float": 0.258276, "price": 0.20},
-                    {"wear": "WW", "exact_float": 0.3951617, "price": 0.18},
-                    {"wear": "BS", "exact_float": 0.450902223, "price": 0.17},
-                ]},
-            ],
-            "rarity_industrial": [
-                {"name": "Desert Eagle | Tilted", "cap_lo": 0.00, "cap_hi": 0.75, "records": [
-                    {"wear": "FN", "exact_float": None, "price": 1.63},
-                    {"wear": "MW", "exact_float": None, "price": 0.35},
-                    {"wear": "FT", "exact_float": None, "price": 0.09},
-                    {"wear": "WW", "exact_float": None, "price": 0.11},
-                    {"wear": "BS", "exact_float": None, "price": 0.07},
-                ]},
-                {"name": "M4A1-S | Wash me plz", "cap_lo": 0.00, "cap_hi": 0.58, "records": [
-                    {"wear": "FN", "exact_float": None, "price": 0.41},
-                    {"wear": "MW", "exact_float": None, "price": 0.08},
-                    {"wear": "FT", "exact_float": None, "price": 0.04},
-                    {"wear": "WW", "exact_float": None, "price": 0.06},
-                    {"wear": "BS", "exact_float": None, "price": 0.05},
-                ]},
-                {"name": "MP5-SD | Neon Squeezer", "cap_lo": 0.20, "cap_hi": 0.90, "records": [
-                    {"wear": "FT", "exact_float": None, "price": 0.08},
-                    {"wear": "WW", "exact_float": None, "price": 0.03},
-                    {"wear": "BS", "exact_float": None, "price": 0.02},
-                ]},
-                {"name": "Negev | Wall Bang", "cap_lo": 0.00, "cap_hi": 1.00, "records": [
-                    {"wear": "FN", "exact_float": None, "price": 1.12},
-                    {"wear": "MW", "exact_float": None, "price": 0.09},
-                    {"wear": "FT", "exact_float": None, "price": 0.02},
-                    {"wear": "WW", "exact_float": None, "price": 0.02},
-                    {"wear": "BS", "exact_float": None, "price": 0.01},
-                ]},
-                {"name": "Five-SeveN | Midnight Paintover", "cap_lo": 0.00, "cap_hi": 0.50, "records": [
-                    {"wear": "FN", "exact_float": None, "price": 0.17},
-                    {"wear": "MW", "exact_float": None, "price": 0.03},
-                    {"wear": "FT", "exact_float": None, "price": 0.02},
-                    {"wear": "WW", "exact_float": None, "price": 0.02},
-                    {"wear": "BS", "exact_float": None, "price": 0.03},
-                ]},
-                {"name": "P90 | Wash me", "cap_lo": 0.00, "cap_hi": 0.50, "records": [
-                    {"wear": "FN", "exact_float": None, "price": 0.17},
-                    {"wear": "MW", "exact_float": None, "price": 0.04},
-                    {"wear": "FT", "exact_float": None, "price": 0.02},
-                    {"wear": "WW", "exact_float": None, "price": 0.02},
-                    {"wear": "BS", "exact_float": None, "price": 0.01},
-                ]},
-            ],
-        },
-    },
-}
-
-
-def _m5a_load_template():
-    """Колбэк кнопки «Загрузить шаблон»: заполняет session_state полей продвинутого
-    режима значениями выбранной коллекции. Выполняется ДО перерисовки (on_click),
-    поэтому виджеты подхватывают значения на следующем ране. Полностью перезаписывает
-    прежний ввод: сначала чистит поля скинов, затем ставит данные шаблона. Данные
-    статичны (в коде), внешнего ввода нет — безопасно."""
-    tpl = COLLECTION_TEMPLATES.get(st.session_state.get("m5a_tpl_select"))
-    if not tpl:
-        return
-    skin_prefixes = ("m5a_n_", "m5a_name_", "m5a_caplo_", "m5a_caphi_", "m5a_nrec_",
-                     "m5a_wear_", "m5a_exon_", "m5a_exact_", "m5a_price_", "m5a_steam_")
-    for k in list(st.session_state.keys()):
-        if k.startswith(skin_prefixes):
-            del st.session_state[k]
-    for rkey, skins in tpl["data"].items():
-        st.session_state[f"m5a_n_{rkey}"] = len(skins)
-        for si, sk in enumerate(skins):
-            st.session_state[f"m5a_name_{rkey}_{si}"] = sk["name"]
-            st.session_state[f"m5a_caplo_{rkey}_{si}"] = float(sk["cap_lo"])
-            st.session_state[f"m5a_caphi_{rkey}_{si}"] = float(sk["cap_hi"])
-            recs = sk["records"]
-            st.session_state[f"m5a_nrec_{rkey}_{si}"] = len(recs)
-            for ri, rec in enumerate(recs):
-                st.session_state[f"m5a_wear_{rkey}_{si}_{ri}"] = rec["wear"]
-                has_f = rec.get("exact_float") is not None
-                st.session_state[f"m5a_exon_{rkey}_{si}_{ri}"] = has_f
-                if has_f:
-                    st.session_state[f"m5a_exact_{rkey}_{si}_{ri}"] = float(rec["exact_float"])
-                st.session_state[f"m5a_price_{rkey}_{si}_{ri}"] = float(rec["price"])
-    st.session_state["m5a_tpl_just_loaded"] = tpl["name"]
-
-
-def _mode_5_advanced(currency, tp):
-    """Продвинутый режим: ввод скинов с резкой и записями качеств, метрики флоата,
-    агрегаты редкости, контрактный ROI и ранги с флоат-бонусом. Защита от поломок:
-    вся валидация на месте, пустые/невалидные записи не ломают расчёт."""
-    st.caption(_(
-        "Advanced mode: for each rarity add skins with their float cap and one or more "
-        "quality records. The ranking then also accounts for float economics — the "
-        "contract value of cleanliness. (The single-currency note still applies.)"
-    ))
-    midpoint = st.checkbox(
-        _("m5a_midpoint_label"),
-        value=False, key="m5a_midpoint", help=_("m5a_midpoint_help"))
-    # Режим расчёта контрактов: «по самым дешёвым» / «по лучшему соотношению».
-    contract_mode = st.radio(
-        _("m5a_cmode_label"), options=["cheapest", "best"],
-        format_func=lambda v: _("m5a_cmode_cheapest") if v == "cheapest" else _("m5a_cmode_best"),
-        key="m5a_contract_mode", help=_("m5a_cmode_help"))
-    # При учёте ТП цен суммы показываются в реальной валюте, иначе — в валюте отображения.
-    disp_ccy = tp["real_ccy"] if tp["enabled"] else currency
-    price_decimals = 0 if is_integer_currency(disp_ccy) else 2
-
-    # Шаблоны готовых коллекций: одна кнопка заполняет все поля (правишь только цены).
-    # Загрузка ПЕРЕЗАПИСЫВАЕТ текущий ввод продвинутого режима.
-    if COLLECTION_TEMPLATES:
-        tc1, tc2 = st.columns([3, 1])
-        with tc1:
-            st.selectbox(
-                _("Collection template"), options=list(COLLECTION_TEMPLATES.keys()),
-                format_func=lambda t: COLLECTION_TEMPLATES[t]["name"], key="m5a_tpl_select")
-        with tc2:
-            st.markdown("<div style='height:1.75rem;'></div>", unsafe_allow_html=True)
-            st.button(_("Load template"), on_click=_m5a_load_template,
-                      key="m5a_tpl_load", use_container_width=True)
-        _just = st.session_state.pop("m5a_tpl_just_loaded", None)
-        if _just:
-            st.success(_("m5a_tpl_loaded_msg").format(name=_just))
-        st.caption(_("m5a_tpl_caption"))
-
-    rarity_data = []
-    for key, color in RARITY_DEFS:
-        with st.expander("● " + _(key), expanded=False):
-            nskins = int(st.number_input(
-                _("Skins in this rarity"), min_value=0, max_value=10, value=0, step=1,
-                key=f"m5a_n_{key}"))
-            skins = []
-            for si in range(nskins):
-                st.markdown(f"**{_('Skin')} {si + 1}**")
-                name = st.text_input(_("Skin name (optional)"), value="",
-                                     key=f"m5a_name_{key}_{si}")
-                cc1, cc2 = st.columns(2)
-                cap_lo = cc1.number_input(
-                    _("Float cap min"), min_value=0.0, max_value=1.0, value=0.0,
-                    step=0.01, format="%.12f", key=f"m5a_caplo_{key}_{si}")
-                cap_hi = cc2.number_input(
-                    _("Float cap max"), min_value=0.0, max_value=1.0, value=1.0,
-                    step=0.01, format="%.12f", key=f"m5a_caphi_{key}_{si}")
-                cap_errs = validate_cap(cap_lo, cap_hi)
-                if cap_errs:
-                    st.warning("⚠️ " + _("Invalid cap: need 0 ≤ min < max ≤ 1."))
-                inter = wears_intersecting_cap(cap_lo, cap_hi) if not cap_errs else list(WEAR_ORDER)
-                if not inter:
-                    inter = list(WEAR_ORDER)
-                nrec = int(st.number_input(
-                    _("Quality records"), min_value=1, max_value=5, value=1, step=1,
-                    key=f"m5a_nrec_{key}_{si}"))
-                records = []
-                for ri in range(nrec):
-                    if tp["enabled"]:
-                        rc1, rc2, rc3, rc4 = st.columns([2, 2, 2, 2])
-                    else:
-                        rc1, rc2, rc3 = st.columns([2, 2, 2])
-                        rc4 = None
-                    wear = rc1.selectbox(_("Quality (wear)"), options=inter,
-                                         key=f"m5a_wear_{key}_{si}_{ri}")
-                    use_exact = rc2.checkbox(_("Exact float"), value=False,
-                                             key=f"m5a_exon_{key}_{si}_{ri}")
-                    exact = None
-                    if use_exact:
-                        mid = min(0.999999, max(0.000001, (cap_lo + cap_hi) / 2.0))
-                        exact = rc2.number_input(
-                            _("Float value"), min_value=0.0, max_value=1.0, value=float(mid),
-                            step=0.000001, format="%.12f", key=f"m5a_exact_{key}_{si}_{ri}")
-                    price = rc3.number_input(_("Price"), min_value=0.0, value=0.0, step=0.1,
-                                             key=f"m5a_price_{key}_{si}_{ri}")
-                    # При учёте ТП цен цена записи = ДЕШЕВЛЕ из внешней и стим-цены (в
-                    # реальной валюте). На этой реальной цене считается ВСЯ флоат-
-                    # математика (наценка за чистоту, контракты, репрезент. цена).
-                    src = None
-                    if rc4 is not None:
-                        steam_price = rc4.number_input(
-                            _("Steam price"), min_value=0.0, value=0.0, step=0.1,
-                            key=f"m5a_steam_{key}_{si}_{ri}")
-                        eff_value, src = effective_real_value(
-                            price, steam_price, tp["rate_site"], tp["rate_steam"], tp["topup"])
-                    else:
-                        eff_value = float(price)
-                    rec = {"wear": wear, "exact_float": exact, "price": float(eff_value),
-                           "_price_source": src}
-                    records.append(rec)
-                    if rec["price"] > 0:
-                        errs = validate_record(rec, cap_lo, cap_hi)
-                        if errs:
-                            st.caption("⚠️ " + "; ".join(errs))
-                        else:
-                            m = record_metrics(rec, cap_lo, cap_hi, midpoint)
-                            if m:
-                                note = ""
-                                if tp["enabled"]:
-                                    money_eff = format_currency(rec["price"], disp_ccy, price_decimals)
-                                    srctxt = (_("price from Steam") if src == "steam"
-                                              else _("price from market") if src == "market" else "")
-                                    note = f" · {money_eff}" + (f" ({srctxt})" if srctxt else "")
-                                st.caption(
-                                    f"{_('cleanliness')} = {m['q'] * 100:.1f}% · w = {m['w']:.12f}" + note)
-                skin_obj = {"name": name or f"{_(key)} #{si + 1}",
-                            "cap_lo": cap_lo, "cap_hi": cap_hi,
-                            "records": records, "agg_choice": None}
-                pt = skin_premium_table(skin_obj, midpoint)
-                if pt:
-                    scored = {r["index"]: r["score"]
-                              for r in float_value_scores(pt["records"], alpha=0.5)}
-                    lines = []
-                    for r in pt["records"]:
-                        wn = wear_of_float(r["eff_float"]) or "?"
-                        qp = f"{r['q'] * 100:.1f}%"
-                        sc = scored.get(r["index"])
-                        sct = f" · {_('score')} {sc:.0f}" if sc is not None else ""
-                        money = format_currency(r["price"], disp_ccy, price_decimals)
-                        if r["status"] == "floor":
-                            lines.append(f"{wn} ({r['eff_float']:.3f}): {_('cleanliness')} {qp} · "
-                                         f"{money} — {_('floor (cheapest)')}{sct}")
-                        elif r["status"] == "premium":
-                            prem = format_currency(r["premium"], disp_ccy, price_decimals)
-                            lines.append(f"{wn} ({r['eff_float']:.3f}): {_('cleanliness')} {qp} · "
-                                         f"{_('cleanliness premium')} {prem}/{_('unit')}{sct}")
-                        else:
-                            lines.append(f"{wn} ({r['eff_float']:.3f}): {_('cleanliness')} {qp} — "
-                                         f"{_('pricier and not cleaner — not worth it')}{sct}")
-                    st.markdown("<div style='font-size:0.85em;opacity:0.85;'>" +
-                                "<br>".join(lines) + "</div>", unsafe_allow_html=True)
-                    if pt["n_records"] < 2:
-                        st.caption("ℹ️ " + _("cleanliness premium: n/a (add a 2nd float to compare)"))
-                    elif not pt["cleaner_exists"]:
-                        st.caption("ℹ️ " + _("cleanliness premium: n/a (the cheapest is already the cleanest)"))
-                skins.append(skin_obj)
-            if skins:
-                rarity_data.append((key, skins))
-
-    results = analyze_collection_advanced(rarity_data, midpoint, contract_mode)
-    st.divider()
-    if not results:
-        st.info(_("Add at least two rarities, each with a valid priced skin, to compare."))
-        return
-
-    name_by_key = {k: _(k) for k, _c in RARITY_DEFS}
-    color_by_key = {k: c for k, c in RARITY_DEFS}
-
-    st.markdown("### 📊 " + _("Ranking with float economics (higher = better buy)"))
-    verdict_label = {
-        "worth": _("clean pays off — worth buying low-float fillers"),
-        "avoid": _("don't overpay for clean — a dirty filler gives the same output"),
-        "unprofitable": _("trade-up into the next rarity is unprofitable"),
-    }
-    header = (
-        "<tr>"
-        f"<th style='text-align:left;padding:6px 10px;'>{_('Rarity')}</th>"
-        f"<th style='text-align:right;padding:6px 10px;'>{_('Price')}</th>"
-        f"<th style='text-align:center;padding:6px 10px;'>{_('Ratio')}</th>"
-        f"<th style='text-align:center;padding:6px 10px;'>{_('Float bonus')}</th>"
-        f"<th style='text-align:center;padding:6px 10px;'>{_('Rank')}</th>"
-        "</tr>"
-    )
-    rows = []
-    for r in results:
-        rank = r["rank"]
-        rcolor = RANK_COLORS.get(rank, "#9e9e9e")
-        ratio_str = "—" if r["ratio"] is None else (
-            _("this rarity = {n}× the rarity below").format(n=f"{r['ratio']:.2f}")
-            if r["role"] == "highest" else
-            _("{n}× this rarity = one rarity above").format(n=f"{r['ratio']:.2f}"))
-        bonus_str = f"+{r['float_bonus']:.2f}" if r["float_bonus"] else "—"
-        badge = (f"<span style='background:{rcolor};color:white;padding:2px 8px;"
-                 f"border-radius:6px;font-weight:700;'>{rank or '—'}</span>")
-        name_cell = (f"<span style='color:{color_by_key.get(r['key'], '#888')};"
-                     f"font-weight:600;'>● </span>{name_by_key.get(r['key'], r['key'])}")
-        rows.append(
-            "<tr style='border-top:1px solid #3a3a3a;'>"
-            f"<td style='text-align:left;padding:6px 10px;'>{name_cell}</td>"
-            f"<td style='text-align:right;padding:6px 10px;'>{format_currency(r['price'], disp_ccy, price_decimals)}</td>"
-            f"<td style='text-align:center;padding:6px 10px;font-size:0.85em;'>{ratio_str}</td>"
-            f"<td style='text-align:center;padding:6px 10px;'>{bonus_str}</td>"
-            f"<td style='text-align:center;padding:6px 10px;'>{badge}</td>"
-            "</tr>")
-    st.markdown("<table style='width:100%;border-collapse:collapse;'><thead>" + header +
-                "</thead><tbody>" + "".join(rows) + "</tbody></table>", unsafe_allow_html=True)
-
-    ranked = [r for r in results if r["rank"] is not None]
-    if ranked:
-        best = max(ranked, key=lambda r: _RANK_ORDER.get(r["rank"], -1))
-        st.success(_("Best buy: {rarity} (rank {rank})").format(
-            rarity=name_by_key.get(best["key"], best["key"]), rank=best["rank"]))
-
-    # Контрактные вердикты и наценка за чистоту по редкости
-    st.markdown("#### 🔧 " + _("Trade-up & float details"))
-    for r in results:
-        nm = name_by_key.get(r["key"], r["key"])
-        fs = r["float_summary"]
-        parts = []
-        if r["net_roi"] is not None and r.get("filler") is not None:
-            fl = r["filler"]
-            line = _("m5a_craft_line").format(
-                skin=_esc(fl["skin"]), wear=_esc(fl["wear"]), f=f"{fl['f']:.4f}",
-                w=f"{r['W_star']:.2f}",
-                price=format_currency(fl["price"], disp_ccy, price_decimals),
-                n=10, cost=format_currency(r["cost"], disp_ccy, price_decimals),
-                eout=format_currency(r["E_out"], disp_ccy, price_decimals),
-                roi=f"{r['roi_full']*100:.0f}", profit=f"{r['net_roi']*100:+.0f}")
-            verdict_txt = verdict_label.get(r["verdict"])
-            parts.append(f"**{_('craft up')}:** "
-                         + (verdict_txt + " " + line if verdict_txt else line))
-        if fs and fs["best_premium"] is not None:
-            best_p = format_currency(fs["best_premium"], disp_ccy, price_decimals)
-            avg_p = format_currency(fs["avg_premium"], disp_ccy, price_decimals)
-            parts.append(_("cheapest cleanliness {b}/{u} ({skin}) · avg {a}/{u}").format(
-                b=best_p, a=avg_p, u=_("unit"), skin=_esc(fs["best_skin"])))
-        else:
-            parts.append(_("cleanliness premium: n/a (skins need ≥2 floats)"))
-        st.markdown(f"<span style='color:{color_by_key.get(r['key'],'#888')};'>● </span>"
-                    f"**{_esc(nm)}** — " + " · ".join(parts), unsafe_allow_html=True)
-
-        # Что конкретно покупать: все кандидаты-филлеры этой редкости в порядке
-        # выбранного режима (первый ✅ — тот, который берёт контракт).
-        cands = r.get("candidates") or []
-        if cands:
-            with st.expander("🛒 " + _("m5a_cands_title").format(n=len(cands)), expanded=False):
-                st.caption(_("m5a_cands_hint_best") if contract_mode == "best"
-                           else _("m5a_cands_hint_cheapest"))
-                chead = (
-                    "<tr>"
-                    f"<th style='text-align:left;padding:6px 10px;'>{_('m5a_col_skin')}</th>"
-                    f"<th style='text-align:center;padding:6px 10px;'>{_('m5a_col_wear')}</th>"
-                    f"<th style='text-align:center;padding:6px 10px;'>{_('m5a_col_float')}</th>"
-                    "<th style='text-align:center;padding:6px 10px;'>w</th>"
-                    f"<th style='text-align:right;padding:6px 10px;'>{_('Price')}</th>"
-                    f"<th style='text-align:right;padding:6px 10px;'>{_('m5a_col_cost')}</th>"
-                    f"<th style='text-align:right;padding:6px 10px;'>{_('m5a_col_eout')}</th>"
-                    f"<th style='text-align:center;padding:6px 10px;'>{_('m5a_col_roi')}</th>"
-                    "</tr>")
-                crows = []
-                for ci, c in enumerate(cands):
-                    top = (ci == 0)
-                    roi_color = "#4caf50" if c["net_roi"] > 0 else "#e05555"
-                    style = "font-weight:600;background:rgba(76,175,80,0.08);" if top else ""
-                    mark = "✅ " if top else ""
-                    crows.append(
-                        f"<tr style='border-top:1px solid #3a3a3a;{style}'>"
-                        f"<td style='text-align:left;padding:6px 10px;'>{mark}{_esc(c['skin'])}</td>"
-                        f"<td style='text-align:center;padding:6px 10px;'>{_esc(c['wear'])}</td>"
-                        f"<td style='text-align:center;padding:6px 10px;font-size:0.85em;'>{c['f']:.4f}</td>"
-                        f"<td style='text-align:center;padding:6px 10px;font-size:0.85em;'>{c['w']:.2f}</td>"
-                        f"<td style='text-align:right;padding:6px 10px;'>{format_currency(c['price'], disp_ccy, price_decimals)}</td>"
-                        f"<td style='text-align:right;padding:6px 10px;'>{format_currency(c['cost'], disp_ccy, price_decimals)}</td>"
-                        f"<td style='text-align:right;padding:6px 10px;'>{format_currency(c['E_out'], disp_ccy, price_decimals)}</td>"
-                        f"<td style='text-align:center;padding:6px 10px;color:{roi_color};'>{c['roi_full'] * 100:.0f}%</td>"
-                        "</tr>")
-                st.markdown("<table style='width:100%;border-collapse:collapse;'><thead>" + chead +
-                            "</thead><tbody>" + "".join(crows) + "</tbody></table>",
-                            unsafe_allow_html=True)
-    st.caption("ℹ️ " + _("Score 0–100 is experimental (relative within a skin, 50/50 clean/cheap)."))
-
-    with st.expander("ℹ️ " + _("How the ranking works")):
-        st.markdown(_("MODE5_FORMULAS"))
-        st.markdown(_("MODE5_ADV_NOTE"))
-
-
-def calculate_mode_5(currency):
-    """Интерфейс Режима 5. Только одна валюта (кросс-курсы не применяются).
-
-    Пользователь вводит цены качеств коллекции; приложение ранжирует, какое
-    качество выгоднее покупать, по соотношению цен соседних качеств.
-    """
-    st.subheader("🎚️ " + _("Best rarity to buy (collection)"))
-    advanced = st.checkbox(_("Advanced float analysis (float & cut)"),
-                           value=False, key="m5_advanced")
-    # Учёт цен Steam (ТП): общий блок для ОБОИХ режимов (простого и продвинутого).
-    # Рендерится ВНЕ формы — тумблер сразу показывает/прячет поля валют и курсов.
-    tp = render_m5_tp_block()
-    if advanced:
-        _mode_5_advanced(currency, tp)
-        return
-
-    st.write(_(
-        "We rank which rarity in a collection is the best buy, based on the price ratio "
-        "between adjacent rarities (10 lower-rarity items trade up into 1 higher-rarity item)."
-    ))
-    st.info(_(
-        "Prices in one currency; use a single float tier (preferably the lowest). Leave a rarity at 0 to exclude it from the collection."
-    ))
-
-    with st.form("m5_form"):
-        st.markdown("#### 🎨 " + _("Rarity prices"))
-        st.caption(_(
-            "Enter the price you consider fair for each rarity. Tick the box if you "
-            "find that rarity's skins beautiful or especially liquid."
-        ))
-        if tp["enabled"]:
-            h_name, h_price, h_steam, h_beauty = st.columns([2, 1, 1, 1])
-            h_steam.markdown("**" + _("Steam price") + "**")
-        else:
-            h_name, h_price, h_beauty = st.columns([2, 1, 1])
-        h_name.markdown("**" + _("Rarity") + "**")
-        h_price.markdown("**" + _("Price") + "**")
-        h_beauty.markdown("**" + _("Beautiful / liquid?") + "**")
-        prices = {}
-        steam_prices = {}
-        beauty = {}
-        for key, color in RARITY_DEFS:
-            label = (f"<span style='color:{color};font-weight:600;'>● </span>" + _(key))
-            if tp["enabled"]:
-                c_name, c_price, c_steam, c_beauty = st.columns([2, 1, 1, 1])
+    col_save, col_info = st.columns([1, 3])
+    with col_save:
+        if st.button("💾 Сохранить изменения", type="primary", use_container_width=True):
+            state = st.session_state.get(editor_key, {})
+            # Диффим относительно ОТОБРАЖАЕМОГО среза в том же порядке — привязка
+            # позиция->id остаётся верной даже при поиске и сортировке.
+            updates, inserts, dels = diff_editor_state(view_deals, state)
+            if not updates and not inserts and not dels:
+                st.info("Нет изменений для сохранения.")
             else:
-                c_name, c_price, c_beauty = st.columns([2, 1, 1])
-                c_steam = None
-            with c_name:
-                st.markdown("<div style='padding-top:0.5rem;'>" + label + "</div>",
-                            unsafe_allow_html=True)
-            with c_price:
-                prices[key] = st.number_input(
-                    _(key), min_value=0.0, value=0.0, step=0.1,
-                    key=f"m5_price_{key}", label_visibility="collapsed",
-                )
-            if c_steam is not None:
-                with c_steam:
-                    steam_prices[key] = st.number_input(
-                        _("Steam price"), min_value=0.0, value=0.0, step=0.1,
-                        key=f"m5_steam_{key}", label_visibility="collapsed",
-                    )
-            with c_beauty:
-                beauty[key] = st.checkbox(
-                    _("Beautiful / liquid?"), value=False,
-                    key=f"m5_beauty_{key}", label_visibility="collapsed",
-                )
-        submitted = st.form_submit_button("🧮 " + _("Calculate"),
-                                          type="primary", use_container_width=True)
+                # Защита от повторного применения одного и того же набора правок
+                # (например, при двойном клике до перерисовки).
+                import json
+                sig = json.dumps({
+                    "u": sorted((u.get("id"), tuple(sorted((k, str(v)) for k, v in u.items())))
+                                for u in updates),
+                    "i": len(inserts), "d": sorted(dels),
+                }, default=str, sort_keys=True)
+                if st.session_state.get("_last_save_sig") == sig:
+                    st.info("Эти изменения уже сохранены.")
+                else:
+                    try:
+                        apply_changes(updates, inserts, dels)
+                    except Exception as e:
+                        st.error(f"Не удалось сохранить изменения: {e}. Данные не записаны — попробуй ещё раз.")
+                    else:
+                        st.session_state["_last_save_sig"] = sig
+                        st.success(f"Сохранено: изменено {len(updates)}, добавлено {len(inserts)}, удалено {len(dels)}.")
+                        st.rerun()
+    with col_info:
+        st.caption("Изменения в таблице не сохранятся, пока не нажата кнопка.")
 
-    if not submitted:
-        st.info(_("Press Calculate to see the results."))
-        return
+    # Проверка охватывает ВСЮ базу (с учётом правок на экране), даже при активном
+    # поиске — иначе несоответствия в скрытых строках остались бы незамеченными.
+    check_label = "вся база, с учётом правок на экране" if query else "предпросмотр изменений на экране"
+    render_data_checks(check_deals, label_suffix=check_label)
 
-    # Берём только заполненные качества, сохраняя порядок редкости. При учёте ТП цен
-    # стоимость предмета = ДЕШЕВЛЕ из внешней и стим-цены (в реальной валюте), плюс
-    # помечаем источник цены.
-    tiers = []
-    for key, color in RARITY_DEFS:
-        if tp["enabled"]:
-            value, source = effective_real_value(
-                prices.get(key, 0.0), steam_prices.get(key, 0.0),
-                tp["rate_site"], tp["rate_steam"], tp["topup"])
-        else:
-            value, source = float(prices.get(key, 0.0)), None
-        if value and value > 0:
-            tiers.append({"key": key, "name": _(key), "color": color,
-                          "price": float(value), "beautiful": bool(beauty.get(key)),
-                          "source": source})
 
-    if len(tiers) < 2:
-        st.warning(_("Enter at least two rarity prices to compare."))
-        return
+def dataframe_to_preview_deals(df):
+    """Преобразует ТЕКУЩИЙ датафрейм редактора в список партий для предпросмотра.
 
-    results = analyze_collection_rarities(tiers)
-
-    # --- Таблица результатов ---
-    st.divider()
-    st.markdown("### 📊 " + _("Ranking (higher = better buy)"))
-
-    header = (
-        "<tr>"
-        f"<th style='text-align:left;padding:6px 10px;'>{_('Rarity')}</th>"
-        f"<th style='text-align:right;padding:6px 10px;'>{_('Price')}</th>"
-        f"<th style='text-align:center;padding:6px 10px;'>{_('Ratio')}</th>"
-        f"<th style='text-align:center;padding:6px 10px;'>{_('Rank')}</th>"
-        f"<th style='text-align:left;padding:6px 10px;'>{_('Comment')}</th>"
-        "</tr>"
-    )
-    rows = []
-    # Для целочисленных валют (₴, ¥, ₩, …) цены выводим без дробной части —
-    # как их показывает сам Steam (паритет с Режимами 1/2). При учёте ТП цен суммы
-    # показываются в реальной валюте.
-    disp_ccy = tp["real_ccy"] if tp["enabled"] else currency
-    price_decimals = 0 if is_integer_currency(disp_ccy) else 2
-    for r in results:
-        rank = r["rank"]
-        rank_color = RANK_COLORS.get(rank, "#9e9e9e")
-        # Ранг и для нижних качеств, и для высшего после реверса означает одно:
-        # высокий ранг — выгодная покупка. Но формулировка комментария зависит от
-        # роли: у нижних качеств соотношение показывается как «N× этого = одно
-        # выше», у высшего — как «это = N× качества ниже». Поэтому берём шкалу по
-        # роли (для высшего — отдельную «highest»), а сверху добавляем пометку про
-        # штраф за инфляцию саплая.
-        scale = _RANK_COMMENT_KEYS["highest"] if r["role"] == "highest" else _RANK_COMMENT_KEYS["lower"]
-        comment_key = scale.get(rank, "rk_normal") if rank else "rk_normal"
-        comment = _(comment_key) if rank else "—"
-        if rank and r["role"] == "highest":
-            comment += " " + _("rk_top_note")
-        if r["beautiful"]:
-            comment += " ✨"
-        if r.get("source") == "steam":
-            comment += " · " + _("price from Steam")
-        elif r.get("source") == "market":
-            comment += " · " + _("price from market")
-        if r["ratio"] is None:
-            ratio_str = "—"
-        elif r["role"] == "highest":
-            ratio_str = _("this rarity = {n}× the rarity below").format(n=f"{r['ratio']:.2f}")
-        else:
-            ratio_str = _("{n}× this rarity = one rarity above").format(n=f"{r['ratio']:.2f}")
-        rank_badge = (
-            f"<span style='background:{rank_color};color:white;padding:2px 8px;"
-            f"border-radius:6px;font-weight:700;'>{rank or '—'}</span>"
-        )
-        name_cell = f"<span style='color:{r['color']};font-weight:600;'>● </span>{r['name']}"
-        rows.append(
-            "<tr style='border-top:1px solid #3a3a3a;'>"
-            f"<td style='text-align:left;padding:6px 10px;'>{name_cell}</td>"
-            f"<td style='text-align:right;padding:6px 10px;'>{format_currency(r['price'], disp_ccy, price_decimals)}</td>"
-            f"<td style='text-align:center;padding:6px 10px;font-size:0.85em;'>{ratio_str}</td>"
-            f"<td style='text-align:center;padding:6px 10px;'>{rank_badge}</td>"
-            f"<td style='text-align:left;padding:6px 10px;font-size:0.9em;'>{comment}</td>"
-            "</tr>"
-        )
-    table_html = (
-        "<table style='width:100%;border-collapse:collapse;'>"
-        + "<thead>" + header + "</thead><tbody>" + "".join(rows) + "</tbody></table>"
-    )
-    st.markdown(table_html, unsafe_allow_html=True)
-
-    # --- Лучшая покупка: наивысший ранг среди качеств с оценкой ---
-    ranked = [r for r in results if r["rank"] is not None]
-    if ranked:
-        best = max(ranked, key=lambda r: _RANK_ORDER.get(r["rank"], -1))
-        st.success(_("Best buy: {rarity} (rank {rank})").format(
-            rarity=best["name"], rank=best["rank"]))
-
-    with st.expander("ℹ️ " + _("Calculation formulas")):
-        st.markdown(_("MODE5_FORMULAS"))
+    Используется только для предварительной проверки/сверки (НЕ для записи).
+    В отличие от записи, здесь поля продажи НЕ обнуляются при снятой галочке
+    «Продано»: иначе предпросмотр не смог бы предупредить о введённых данных
+    продажи без отметки (и пользователь молча потерял бы их при сохранении).
+    Значения только приводятся к корректным типам; смысл строки сохраняется.
+    Количество тоже НЕ «чинится» до 1: если в строке стоит 0 или мусор, оно
+    остаётся как есть (через _to_int с дефолтом 0 для пустых), чтобы проверка
+    данных могла предупредить о некорректном количестве, а не сгладить его молча.
+    """
+    deals = []
+    for _, row in df.iterrows():
+        if not _meaningful_row(row):
+            continue
+        d = {
+            "item_name": str(_num(row.get("item_name"), "") or "").strip(),
+            "buy_date": _to_iso(row.get("buy_date", "")),
+            "steam_buy_price": max(0.0, _to_float(row.get("steam_buy_price"), 0.0)),
+            "quantity": _to_int(row.get("quantity"), 0),
+            "deposit_profit_pct": _to_float(row.get("deposit_profit_pct"), 0.0),
+            "buy_uah_per_usd": max(0.0, _to_float(row.get("buy_uah_per_usd"), 0.0)),
+            "sold": 1 if _to_bool(row.get("sold")) else 0,
+            "sell_date": _to_iso(row.get("sell_date", "")),
+            "site_sell_price": max(0.0, _to_float(row.get("site_sell_price"), 0.0)),
+            "sales_fee_pct": max(0.0, _to_float(row.get("sales_fee_pct"), 0.0)),
+            "sell_uah_per_usd": max(0.0, _to_float(row.get("sell_uah_per_usd"), 0.0)),
+        }
+        if "_id" in row and not _is_blank(row.get("_id")):
+            d["id"] = _to_int(row.get("_id"), 0)
+        if "_lot_group" in row and not _is_blank(row.get("_lot_group")):
+            d["lot_group"] = str(row.get("_lot_group")).strip()
+        deals.append(d)
+    return deals
 
 
 # ===========================================================================
-# РЕЖИМ 4: АНАЛИЗАТОР ВЫГОДНОЙ ПРОДАЖИ ("ГДЕ ПРОДАТЬ ВЫГОДНЕЕ?")
+# UI: СВОДКА
 # ===========================================================================
 
-def calculate_mode_4(currency, advanced):
-    """Интерфейс Режима 4. currency — валюта отображения; advanced — режим кросс-курсов.
+def render_summary(deals):
+    """Итоги по всем партиям (в ₴ и $) и помесячная реализованная прибыль."""
+    st.subheader("📈 Сводка")
 
-    Сравниваем два пути продажи скина:
-        Вариант А — продать на стороннем сайте, вывести деньги и пополнить Steam в плюс;
-        Вариант Б — продать напрямую на Steam Market (Steam удерживает ~15%).
-
-    Оба варианта дают Steam-баланс как итог, поэтому сравнение прямое.
-    """
-    st.subheader("📊 " + _("Where to sell more profitably?"))
-    st.write(_(
-        "We compare selling a skin on a third-party site (then topping up Steam at a profit) "
-        "versus selling it directly on the Steam Market."
-    ))
-
-    # --- Вне формы: (опц.) валюты кросс-курсов ---
-    spent_ccy = site_ccy = steam_ccy = None
-    if advanced:
-        spent_ccy, site_ccy, steam_ccy = render_cross_currency_selectors("m4")
-
-    rate_site_to_spent, rate_steam_to_spent = 1.0, 1.0
-
-    # --- Форма ---
-    with st.form("m4_form"):
-        col_site, col_steam = st.columns(2)
-
-        with col_site:
-            st.markdown("#### 🛒 " + _("Sell on third-party site → top up Steam"))
-            site_sell_price = st.number_input(
-                _("Site sell price"),
-                min_value=0.0, value=12.0, step=0.5, key="m4_site_sell",
-            )
-            quantity = st.number_input(
-                _("Quantity"), min_value=1, value=1, step=1, key="m4_qty",
-            )
-            sales_fee = st.number_input(
-                _("Sales fee (%)"),
-                min_value=0.0, max_value=100.0, value=2.0, step=0.5, key="m4_sales_fee",
-            )
-            withdrawal_fee = st.number_input(
-                _("Withdrawal fee (%)"),
-                min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="m4_wd_fee",
-            )
-            withdrawal_fixed_usd = st.number_input(
-                _("Withdrawal fixed fee (USD)"),
-                min_value=0.0, value=0.0, step=0.5, key="m4_wd_fixed",
-            )
-            deposit_profit = st.number_input(
-                _("Steam top-up profit (%)"),
-                min_value=-99.9, value=50.0, step=1.0, key="m4_deposit_profit",
-                help=_(
-                    "How profitably you topped up Steam earlier. "
-                    "Example: spent 10 real, got 15 on balance → 50% profit."
-                ),
-            )
-
-        with col_steam:
-            st.markdown("#### 🏪 " + _("Sell on Steam Market directly"))
-            steam_sell_price = st.number_input(
-                _("Steam sell price (buyer pays)"),
-                min_value=0.0, value=15.0, step=0.5, key="m4_steam_sell",
-                help=_("The price shown to buyers on the Steam Market."),
-            )
-            steam_fee_total = st.number_input(
-                _("Steam Market fee (%)"),
-                min_value=0.0, max_value=100.0, value=15.0, step=0.5, key="m4_steam_fee",
-                help=_("Default 15% = 10% CS2 fee + 5% Steam fee."),
-            )
-
-        if advanced:
-            st.divider()
-            rate_site_to_spent, rate_steam_to_spent = render_cross_currency_rates(
-                "m4", spent_ccy, site_ccy, steam_ccy)
-
-        # Фиксированная комиссия вывода задаётся в USD → приводится к валюте сайта.
-        fixed_in_site = resolve_fixed_fee_in_target(
-            "m4", withdrawal_fixed_usd, True, advanced,
-            currency, spent_ccy, site_ccy, rate_site_to_spent)
-
-        submitted = st.form_submit_button("🧮 " + _("Calculate"),
-                                          type="primary", use_container_width=True)
-
-    if not submitted:
-        st.info(_("Press Calculate to see the results."))
+    if not deals:
+        st.info("Пока нет данных для сводки.")
         return
 
-    # --- Контекст валют ---
-    if advanced:
-        output_ccy = spent_ccy or DEFAULT_CURRENCY
-        steam_side_ccy = steam_ccy or DEFAULT_CURRENCY
+    df = build_dataframe(deals)
+    # «Реализованными» считаем только ПОЛНЫЕ продажи: отмечены проданными, есть
+    # цена И дата продажи И корректное количество (≥1). Требование даты — чтобы
+    # общий итог и помесячный график охватывали ОДНИ И ТЕ ЖЕ строки. Битые строки
+    # (quantity<1) исключаются из ВСЕХ метрик, чтобы итог не считался по
+    # подменённым значениям (в расчёте количество форсится в 1, но в сводных
+    # цифрах такие строки участвовать не должны).
+    sold_mask = df["sold"] == True  # noqa: E712  (булева колонка)
+    has_price = df["site_sell_price"].fillna(0) > 0
+    has_date = df["sell_date"].notna()
+    valid_qty = df["quantity"].fillna(0) >= 1
+    has_buy_rate = df["buy_uah_per_usd"].fillna(0) > 0
+
+    closed = df[sold_mask & has_price & has_date & valid_qty]
+    # Долларовые итоги считаем ТОЛЬКО по строкам с заданным курсом покупки: без
+    # него долларовая себестоимость = 0, и USD-прибыль/ROI были бы завышены.
+    closed_usd = closed[closed["buy_uah_per_usd"].fillna(0) > 0]
+    incomplete = df[sold_mask & ~(has_price & has_date)]
+    bad_qty = df[sold_mask & has_price & has_date & ~valid_qty]
+    open_pos = df[~sold_mask & valid_qty]
+
+    realized_profit_uah = float(closed["profit_uah"].fillna(0).sum()) if not closed.empty else 0.0
+    realized_profit_usd = float(closed_usd["profit_usd"].fillna(0).sum()) if not closed_usd.empty else 0.0
+    closed_cost_uah = float(closed["real_cost_uah"].fillna(0).sum()) if not closed.empty else 0.0
+    open_cost_uah = float(open_pos["real_cost_uah"].fillna(0).sum()) if not open_pos.empty else 0.0
+    overall_roi = (realized_profit_uah / closed_cost_uah * 100.0) if closed_cost_uah > 0 else None
+    wins = int((closed["profit_uah"].fillna(0) > 0).sum()) if not closed.empty else 0
+    win_rate = (wins / len(closed) * 100.0) if len(closed) > 0 else 0.0
+    qty_open = int(open_pos["quantity"].sum()) if not open_pos.empty else 0
+    # Сколько закрытых продаж без курса покупки (их $-прибыль не учтена).
+    no_rate_count = int(len(closed) - len(closed_usd))
+
+    m1, m2, m3 = st.columns(3)
+    # ROI не определён при нулевой себестоимости (например, бесплатные дропы): показываем
+    # «н/д», а не обманчивые 0%. Если закрытых продаж нет вовсе — дельту не показываем.
+    if overall_roi is not None:
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴", delta=f"{overall_roi:+.1f}% ROI")
+    elif not closed.empty:
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴",
+                  delta="ROI н/д (себестоимость 0)", delta_color="off")
     else:
-        output_ccy = currency
-        steam_side_ccy = currency
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴")
+    usd_note = f"≈ {realized_profit_usd:,.2f} $"
+    if no_rate_count > 0:
+        usd_note += f" (без {no_rate_count} партий без курса покупки)"
+    m1.caption(usd_note)
+    m2.metric("В остатках на руках", f"{open_cost_uah:,.2f} ₴")
+    m2.caption(f"{qty_open} шт в {len(open_pos)} открытых партиях")
+    m3.metric("Доля прибыльных", f"{win_rate:.0f}%")
+    m3.caption(f"{wins} из {len(closed)} завершённых продаж")
 
-    quantity = max(1, int(quantity))
+    if not incomplete.empty:
+        st.warning(f"Не учтено в итогах: {len(incomplete)} партий отмечены проданными, но без цены "
+                   "или даты продажи. Заполни оба поля в журнале, чтобы они попали в реализованную "
+                   "прибыль и в помесячный график.")
+    if not bad_qty.empty:
+        st.warning(f"Исключено из итогов: {len(bad_qty)} партий с некорректным количеством (меньше 1). "
+                   "Поправь количество в журнале.")
+    if no_rate_count > 0:
+        st.warning(f"Долларовая прибыль посчитана без {no_rate_count} проданных партий, у которых не "
+                   "задан курс покупки (для них долларовая себестоимость неизвестна). Гривневый итог "
+                   "по ним учтён. Заполни курс покупки в журнале для точного $-итога.")
 
-    # --- Вариант А: продать на сайте → реальные деньги → пополнить Steam ---
-    result_site = calculate_sell_via_site_topup(
-        site_sell_price=site_sell_price,
-        quantity=quantity,
-        sales_fee_percent=sales_fee,
-        withdrawal_fee_percent=withdrawal_fee,
-        withdrawal_fixed_fee=fixed_in_site,
-        deposit_profit_percent=deposit_profit,
-    )
-
-    # --- Вариант Б: продать напрямую на Steam Market ---
-    result_steam = calculate_steam_market_sell(
-        steam_sell_price=steam_sell_price,
-        quantity=quantity,
-        total_steam_fee_percent=steam_fee_total,
-        currency_code=steam_side_ccy,
-    )
-
-    # --- Приведение к базовой валюте для сравнения ---
-    if advanced:
-        # Вариант А: реальные деньги (сайт) → базовая валюта → мысленное пополнение Steam
-        # Вариант Б: Steam-баланс → базовая валюта (по курсу Steam→base)
-        real_money_base_a = result_site["real_money"] * max(0.0, rate_site_to_spent)
-        divisor_a = max(0.0, 1.0 + deposit_profit / 100.0)
-        steam_balance_a = real_money_base_a * divisor_a
-        steam_balance_b = result_steam["steam_balance"] * max(0.0, rate_steam_to_spent)
-    else:
-        steam_balance_a = result_site["steam_balance"]
-        steam_balance_b = result_steam["steam_balance"]
-
-    # --- Вывод результатов ---
-    st.divider()
-    st.markdown("### 📊 " + _("Results comparison"))
-
-    # Для целочисленных валют введённая цена продажи на Steam (сторона покупателя)
-    # могла быть приведена к ближайшей достижимой — сообщаем об этом, как в Режиме 1.
-    if (result_steam["valid_buyer"] is not None
-            and result_steam["valid_buyer"] != result_steam["requested_unit"]):
-        st.warning(_("Price {x} is impossible in Steam for integer currencies. "
-                     "Rounded to the nearest possible: {y}.").format(
-            x=result_steam["requested_unit"], y=result_steam["valid_buyer"]))
-
-    m_site, m_steam = st.columns(2)
-    m_site.metric(
-        _("Steam balance via site (with top-up)"),
-        format_currency(steam_balance_a, output_ccy),
-    )
-    # Подсказка: сколько реальных денег пришло с сайта (до пополнения)
-    real_money_display = (result_site["real_money"] * max(0.0, rate_site_to_spent)
-                          if advanced else result_site["real_money"])
-    m_site.caption(
-        _("Real money from site: {amount}").format(
-            amount=format_currency(real_money_display, output_ccy))
-    )
-
-    m_steam.metric(
-        _("Steam balance via Steam Market"),
-        format_currency(steam_balance_b, output_ccy),
-    )
-    # В продвинутом режиме — показываем исходные значения до конвертации.
-    if advanced:
-        st.caption(
-            f"{_('Site')} → real: {format_currency(result_site['real_money'], site_ccy or '?')} · "
-            f"{_('Steam Market')} → balance: "
-            f"{format_currency(result_steam['steam_balance'], steam_side_ccy or '?')}"
-        )
-
-    # --- Вердикт ---
-    diff = steam_balance_a - steam_balance_b
-    both_zero = steam_balance_a <= 0 and steam_balance_b <= 0
-
-    if both_zero:
-        st.info(_("Enter data to see the comparison."))
-    elif diff > 1e-4:
-        st.success(_(
-            "Selling via site and topping up Steam is more profitable. "
-            "Extra Steam balance: {amount}."
-        ).format(amount=format_currency(diff, output_ccy)))
-    elif diff < -1e-4:
-        st.success(_(
-            "Selling on Steam Market is more profitable. "
-            "Extra Steam balance: {amount}."
-        ).format(amount=format_currency(-diff, output_ccy)))
-    else:
-        st.warning(_("Both options yield the same Steam balance."))
-
-    with st.expander("ℹ️ " + _("Calculation formulas")):
-        st.markdown(_("MODE4_FORMULAS"))
+    if not closed.empty:
+        monthly = closed.dropna(subset=["sell_date"]).copy()
+        if not monthly.empty:
+            monthly["Месяц"] = monthly["sell_date"].dt.strftime("%Y-%m")
+            by_month = monthly.groupby("Месяц")["profit_uah"].sum().reset_index()
+            by_month = by_month.rename(columns={"profit_uah": "Прибыль, ₴"})
+            st.markdown("##### Прибыль по месяцам (₴)")
+            st.bar_chart(by_month, x="Месяц", y="Прибыль, ₴", use_container_width=True)
 
 
-def calculate_mode_3(currency, advanced):
-    """Интерфейс Режима 3. currency — валюта отображения; advanced — режим кросс-курсов.
+# ===========================================================================
+# UI: ЭКСПОРТ
+# ===========================================================================
 
-    Сценарий: покупка предмета на Торговой площадке Steam за баланс, продажа на
-    стороннем сайте и вывод выручки на карту/крипту. Цель — оценить, какая доля
-    баланса Steam доходит до реальных денег (коэффициент вывода).
+def render_export(deals):
+    """Выгрузка журнала в CSV и Excel для бэкапа/внешнего просмотра."""
+    if not deals:
+        return
+    st.subheader("💾 Экспорт")
+    df = build_dataframe(deals).drop(columns=["_id", "_lot_group"])
+    export_df = df.copy()
+    export_df["buy_date"] = export_df["buy_date"].dt.strftime("%Y-%m-%d")
+    export_df["sell_date"] = export_df["sell_date"].dt.strftime("%Y-%m-%d")
+
+    col_csv, col_xlsx = st.columns(2)
+    with col_csv:
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Скачать CSV", data=csv_bytes, file_name="steam_ledger.csv",
+                           mime="text/csv", use_container_width=True)
+    with col_xlsx:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            export_df.to_excel(writer, index=False, sheet_name="Сделки")
+        st.download_button("⬇️ Скачать Excel", data=buffer.getvalue(), file_name="steam_ledger.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
+    st.caption(f"База данных хранится локально: {DB_PATH.name} (рядом с приложением).")
+
+    # --- Резервные копии ---
+    st.markdown("##### 🛟 Резервные копии")
+    backups = list_backups()
+    col_btn, col_info = st.columns([1, 3])
+    with col_btn:
+        if st.button("📦 Сделать бэкап сейчас", use_container_width=True):
+            status, path = make_backup(force=True, manual=True)
+            if status == "created":
+                st.toast(f"Бэкап сохранён: {path.name}", icon="📦")
+            else:
+                st.toast("Не удалось создать бэкап (проверь место и права на папку).", icon="⚠️")
+            st.rerun()
+    with col_info:
+        if backups:
+            newest = backups[0].name
+            st.caption(f"Копий: {len(backups)} (хранится до {BACKUP_KEEP_DAILY} ежедневных "
+                       f"и {BACKUP_KEEP_MANUAL} ручных). Свежая: {newest}. Папка: {BACKUP_DIR.name}/")
+        else:
+            st.caption(f"Копий пока нет. Бэкап создаётся автоматически раз в сутки при запуске; "
+                       f"папка: {BACKUP_DIR.name}/")
+        st.caption("Автоматический бэкап создаётся при ПЕРВОМ запуске приложения в этот день "
+                   "(одна копия в сутки) — это снимок состояния на момент того запуска, до правок "
+                   "в текущей сессии. Чтобы откатиться, закрой приложение и замени deals.db "
+                   "выбранной копией из папки backups.")
+
+
+# ===========================================================================
+# UI: УДАЛЕНИЕ ПАРТИИ (двухшаговое подтверждение + бэкап перед удалением)
+# ===========================================================================
+
+def render_delete(deals):
+    """Удаление выбранной партии по стабильному id с защитой от случайных кликов.
+
+    Удаляется ровно одна партия (строка). Подтверждение двухшаговое: сначала
+    «Удалить выбранную партию», затем явное «Да, удалить» — одиночный случайный
+    клик ничего не стирает. Перед удалением создаётся резервная копия базы
+    (ежедневный снимок при этом не вытесняется — см. prune_backups). Удаление не
+    пересчитывает другие партии; если удаляется часть дробившейся покупки — об
+    этом предупреждаем, остальные части группы остаются.
     """
-    st.subheader("💳 " + _("Steam balance cashout calculator"))
-    st.write(_("We calculate how much real money you receive by buying a skin on the Steam Market, "
-               "selling it on a third-party site, and withdrawing the proceeds."))
+    if not deals:
+        return
+    st.subheader("🗑 Удаление партии")
+    st.caption("Безвозвратно удаляет выбранную партию — например, ошибочную запись. "
+               "Удаление с подтверждением; перед ним создаётся резервная копия базы. "
+               "Другие партии при этом не пересчитываются.")
 
-    # Управляющие элементы вне формы: валюты кросс-курсов (если включён режим).
-    spent_ccy = site_ccy = steam_ccy = None
-    if advanced:
-        spent_ccy, site_ccy, steam_ccy = render_cross_currency_selectors("m3")
+    # Все партии (и открытые, и проданные), новые сверху — чтобы удобно найти свежую ошибку.
+    ordered = sorted(
+        deals,
+        key=lambda d: (_parse_iso(d.get("buy_date")) or date.min, d.get("id", 0)),
+        reverse=True,
+    )
+    id_by_label, labels = {}, []
+    for d in ordered:
+        lbl = lot_delete_label(d)
+        id_by_label[lbl] = int(d["id"])
+        labels.append(lbl)
 
-    # Значения по умолчанию на случай отключённых блоков.
-    rate_site_to_spent, rate_steam_to_spent = 1.0, 1.0
+    chosen_label = st.selectbox("Партия для удаления", labels, key="delete_select")
+    chosen_id = id_by_label.get(chosen_label)
 
-    # Поля и кнопка внутри st.form: пересчёт выполняется только по нажатию.
-    with st.form("m3_form"):
-        col_buy, col_sell = st.columns(2)
+    # Если выбрали ДРУГУЮ партию — сбрасываем ранее «взведённое» подтверждение,
+    # чтобы случайно не удалить не ту запись.
+    pending = st.session_state.get("pending_delete_id")
+    if pending is not None and pending != chosen_id:
+        st.session_state.pop("pending_delete_id", None)
+        pending = None
 
-        with col_buy:
-            st.markdown("#### 🏪 " + _("Purchase (Steam Market)"))
-            steam_price = st.number_input(
-                _("Steam purchase price"),
-                min_value=0.0, value=15.0, step=0.5, key="m3_steam_price",
-            )
-            quantity = st.number_input(
-                _("Quantity"), min_value=1, value=1, step=1, key="m3_qty",
-            )
-            deposit_profit = st.number_input(
-                _("Steam top-up profit (%)"),
-                min_value=-99.9, value=0.0, step=1.0, key="m3_deposit_profit",
-                help=_(
-                    "How profitably you topped up Steam earlier. "
-                    "Example: spent 10 real, got 15 on balance → 50% profit."
-                ),
-            )
-
-        with col_sell:
-            st.markdown("#### 💳 " + _("Withdrawal (third-party site)"))
-            site_sell_price = st.number_input(
-                _("Site sell price"),
-                min_value=0.0, value=12.0, step=0.5, key="m3_site_sell",
-            )
-            sales_fee = st.number_input(
-                _("Sales fee (%)"),
-                min_value=0.0, max_value=100.0, value=2.0, step=0.5, key="m3_sales_fee",
-            )
-            withdrawal_fee = st.number_input(
-                _("Withdrawal fee (%)"),
-                min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="m3_wd_fee",
-            )
-            withdrawal_fixed_usd = st.number_input(
-                _("Withdrawal fixed fee (USD)"),
-                min_value=0.0, value=0.0, step=0.5, key="m3_wd_fixed",
-            )
-
-        if advanced:
-            st.divider()
-            rate_site_to_spent, rate_steam_to_spent = render_cross_currency_rates(
-                "m3", spent_ccy, site_ccy, steam_ccy)
-
-        # Фиксированная комиссия вывода задаётся в USD и приводится к валюте сайта
-        # (комиссии сайта удерживаются именно в валюте сайта). enable_fees=True,
-        # так как поле фиксы в этом режиме присутствует всегда.
-        fixed_in_site = resolve_fixed_fee_in_target(
-            "m3", withdrawal_fixed_usd, True, advanced,
-            currency, spent_ccy, site_ccy, rate_site_to_spent)
-
-        submitted = st.form_submit_button("🧮 " + _("Calculate"),
-                                          type="primary", use_container_width=True)
-
-    # Результаты выводятся только после нажатия кнопки.
-    if not submitted:
-        st.info(_("Press Calculate to see the results."))
+    # Шаг 1: кнопка «взводит» подтверждение для выбранной партии (ещё не удаляет).
+    if pending != chosen_id:
+        if st.button("🗑 Удалить выбранную партию", key="delete_arm"):
+            st.session_state["pending_delete_id"] = chosen_id
+            st.rerun()
         return
 
-    # Валютный контекст вывода: база (карта) — итоговая валюта результата.
-    # steam_side_ccy — валюта стороны Steam (в ней удерживается цена покупки на
-    # Торговой площадке), как в Режимах 1/2.
-    if advanced:
-        steam_side_ccy = steam_ccy
-        output_ccy = spent_ccy or DEFAULT_CURRENCY
-    else:
-        steam_side_ccy = currency
-        output_ccy = currency
+    # Шаг 2: подтверждение взведено именно для chosen_id — показываем предупреждение.
+    d = next((x for x in deals if int(x.get("id", -1)) == chosen_id), None)
+    if d is None:  # партия исчезла (например, удалена в другом месте) — сбрасываем.
+        st.session_state.pop("pending_delete_id", None)
+        st.rerun()
+        return
 
-    quantity = max(1, int(quantity))
+    # Предупреждение о группе (дробившаяся покупка): останутся другие её части.
+    group = str(d.get("lot_group") or "").strip()
+    group_note = ""
+    if group:
+        siblings = [x for x in deals
+                    if str(x.get("lot_group") or "").strip() == group
+                    and int(x.get("id", -1)) != chosen_id]
+        if siblings:
+            group_note = (f"\n\n⚠️ Партия входит в группу с другими ({len(siblings)} шт — "
+                          "покупка дробилась на части/продажи). Удаление только этой части "
+                          "может нарушить сверку по группе (блок «Сверка покупок»); "
+                          "остальные части останутся.")
 
-    # Сторона Steam: для целочисленных валют (₴, ¥, ₩ и т. п.) Steam не принимает
-    # дробную цену, поэтому цену покупки приводим к целому («half up», как в
-    # решателе) и предупреждаем пользователя об изменении — паритет с Режимами 1/2.
-    if is_integer_currency(steam_side_ccy):
-        rounded_steam_price = float(round_half_up_int(steam_price))
-        if rounded_steam_price != float(steam_price):
-            st.warning(_("Steam has no fractions for this currency; price rounded to {y}.").format(
-                y=int(rounded_steam_price)))
-        steam_price = rounded_steam_price
-
-    # Расчёт в валюте сайта: затраты Steam и стороны сайта изначально в разных
-    # валютах, поэтому Steam-затраты считаем отдельно, а денежный поток сайта —
-    # через чистую функцию, приведя обе стороны к базовой валюте далее.
-    cashout = calculate_cashout(
-        steam_price=steam_price, site_sell_price=site_sell_price, quantity=quantity,
-        sales_fee_percent=sales_fee, withdrawal_fee_percent=withdrawal_fee,
-        withdrawal_fixed_fee=fixed_in_site,
-    )
-
-    # Приведение к базовой валюте (карты).
-    if advanced:
-        steam_spent_base = max(0.0, cashout["steam_spent"]) * max(0.0, rate_steam_to_spent)
-        real_received_base = max(0.0, cashout["real_received"]) * max(0.0, rate_site_to_spent)
-    else:
-        steam_spent_base = cashout["steam_spent"]
-        real_received_base = cashout["real_received"]
-
-    net_profit_base = real_received_base - steam_spent_base
-    ratio_base = (real_received_base / steam_spent_base * 100.0) if steam_spent_base > 0 else 0.0
-
-    # --- Вывод результатов ---
-    st.divider()
-    st.markdown("### 📊 " + _("Results"))
-
-    # Если задан % плюса пополнения — пересчитываем реальные затраты на Steam-баланс.
-    # deposit_profit=0 => real_steam_cost = steam_spent (поведение идентично прежнему).
-    use_deposit = deposit_profit != 0.0
-    if use_deposit:
-        real_steam_cost_base = calculate_steam_real_cost(steam_spent_base, deposit_profit)
-        display_ratio = (real_received_base / real_steam_cost_base * 100.0
-                         ) if real_steam_cost_base > 0 else 0.0
-        net_result_base = real_received_base - real_steam_cost_base
-    else:
-        real_steam_cost_base = steam_spent_base
-        display_ratio = ratio_base
-        net_result_base = net_profit_base
-
-    base_ratio_delta = display_ratio - 100.0
-
-    m_spent, m_received, m_ratio = st.columns(3)
-
-    if use_deposit:
-        # Колонка «потрачено»: баланс Steam сверху, реальная стоимость — подписью.
-        m_spent.metric(
-            _("Total Steam spent"),
-            format_currency(steam_spent_base, output_ccy),
-        )
-        m_spent.caption(
-            f"↳ {_('Real Steam cost (with top-up)')}: "
-            f"**{format_currency(real_steam_cost_base, output_ccy)}**"
-        )
-        m_ratio.metric(
-            _("Effective cashout ratio"),
-            f"{display_ratio:.1f}%",
-            help=_("Top-up profit factored in. Ratio > 100% means you profit even after cashing out."),
-        )
-    else:
-        m_spent.metric(_("Total Steam spent"), format_currency(steam_spent_base, output_ccy))
-        m_ratio.metric(_("Cashout ratio"), f"{display_ratio:.1f}%")
-
-    m_received.metric(_("Real money received"), format_currency(real_received_base, output_ccy))
-
-    # Чистый результат: знак процента используется как delta (красный для минуса).
-    st.metric(
-        _("Net profit / loss"),
-        format_currency(net_result_base, output_ccy),
-        delta=f"{base_ratio_delta:+.1f}%",
-    )
-
-    # В продвинутом режиме — промежуточные суммы в исходных валютах.
-    if advanced:
-        st.caption(
-            f"{_('Gross site revenue')}: "
-            f"{format_currency(cashout['gross_revenue'], site_ccy or '?')} · "
-            f"{_('After sales fee')}: "
-            f"{format_currency(cashout['after_sales'], site_ccy or '?')}")
-
-    # Итоговый вердикт по чистому результату.
-    if steam_spent_base <= 0:
-        st.info(_("Enter prices to see the cashout calculation."))
-    elif net_result_base > 0:
-        st.success(_("Top-up in profit: +{amount} ({percent}).").format(
-            amount=format_currency(net_result_base, output_ccy),
-            percent=f"{base_ratio_delta:+.1f}%"))
-    elif net_result_base < 0:
-        st.error(_("Top-up at a loss: {amount} ({percent}).").format(
-            amount=format_currency(net_result_base, output_ccy),
-            percent=f"{base_ratio_delta:+.1f}%"))
-    else:
-        st.warning(_("Break-even result."))
-
-    st.caption(_("The higher the cashout ratio, the more of your Steam balance reaches your card."))
-
-    with st.expander("ℹ️ " + _("Calculation formulas")):
-        st.markdown(_("MODE3_FORMULAS"))
+    st.warning("⚠️ Подтверди удаление — действие необратимо.\n\n"
+               f"**{lot_delete_label(d)}**" + group_note)
+    c_yes, c_no = st.columns(2)
+    with c_yes:
+        if st.button("✅ Да, удалить безвозвратно", type="primary",
+                     key="delete_confirm", use_container_width=True):
+            try:
+                status, path = make_backup(force=True, manual=True)
+                apply_changes([], [], [chosen_id])
+            except Exception as e:
+                st.error(f"Не удалось удалить партию: {e}. Данные не изменены — попробуй ещё раз.")
+            else:
+                st.session_state.pop("pending_delete_id", None)
+                if status == "created":
+                    st.toast(f"Партия #{chosen_id} удалена. Бэкап: {path.name}", icon="🗑️")
+                else:
+                    st.toast(f"Партия #{chosen_id} удалена (резервную копию создать не удалось)",
+                             icon="⚠️")
+                st.rerun()
+    with c_no:
+        if st.button("Отмена", key="delete_cancel", use_container_width=True):
+            st.session_state.pop("pending_delete_id", None)
+            st.rerun()
 
 
 # ===========================================================================
@@ -4060,78 +1753,30 @@ def calculate_mode_3(currency, advanced):
 # ===========================================================================
 
 def main():
-    """Точка входа: настройка страницы, выбор языка, сайдбар и вкладки режимов."""
-    st.set_page_config(
-        page_title="Yev Steam Deposit Calculator",
-        page_icon="🎯",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Yev Steam Trading Ledger", page_icon="📒", layout="wide")
+    init_db()
+    # Снимок состояния на момент первого запуска за день — до любых правок в
+    # этой сессии. Не чаще одной копии в сутки; ошибки бэкапа не мешают работе.
+    make_backup()
 
-    # Язык восстанавливается до отрисовки, чтобы подписи были корректны при
-    # повторных запусках скрипта (значение хранится в session_state).
-    st.session_state.setdefault("lang_name", DEFAULT_LANG_NAME)
-    set_language(LANG_OPTIONS[st.session_state["lang_name"]])
+    st.title("📒 Yev Steam Trading Ledger")
+    st.caption("Личный журнал сделок: покупка за баланс Steam (₴), продажа на сайте ($). "
+               "Раздельные курсы покупки и продажи, продажи по частям, итоги в обеих валютах. "
+               "Данные хранятся локально.")
 
-    # --- Сайдбар: общие настройки ---
-    with st.sidebar:
-        st.title("⚙️ " + _("Settings"))
+    deals = fetch_deals()
 
-        # Выбор языка. После выбора синхронизируем активный язык.
-        lang_name = st.selectbox(_("Language"), list(LANG_OPTIONS.keys()), key="lang_name")
-        set_language(LANG_OPTIONS[lang_name])
-
-        currency = st.selectbox(
-            _("Display currency"), CURRENCIES, index=CURRENCIES.index(DEFAULT_CURRENCY),
-        )
-
-        # Переключатель продвинутого валютного режима (по умолчанию выключен).
-        advanced = st.checkbox(
-            _("Advanced currency mode (cross-rates)"), value=False,
-            help=_("When enabled, all modes let you set separate currencies "
-                   "for your card, the site, and Steam."),
-        )
-
-        st.divider()
-        st.caption(_("CS2 Skin Investing Toolkit"))
-        st.caption(_("All prices are entered manually. This is a calculator, not financial advice."))
-        st.caption("⚠️ " + _("This is an analytical tool, not financial advice. All investments carry risks."))
-
-    # --- Заголовок ---
-    st.title("🎯 Yev Steam Deposit Calculator")
-    st.caption(_("Steam top-up profit, skin purchase and CS2 collection analyzer")
-               + f" · v{APP_VERSION}")
-
-    # --- Новости (статичные сообщения из кода) ---
-    render_news()
-
-    # --- Вкладки режимов ---
-    tab_mode_1, tab_mode_2, tab_mode_3, tab_mode_4, tab_mode_5 = st.tabs([
-        "💰 " + _("Balance top-up (profit)"),
-        "🔍 " + _("Where to buy cheaper?"),
-        "💳 " + _("Withdrawal (Cashout)"),
-        "📈 " + _("Where to sell more profitably?"),
-        "🎚️ " + _("Best rarity to buy (collection)"),
-    ])
-    with tab_mode_1:
-        calculate_mode_1(currency, advanced)
-    with tab_mode_2:
-        calculate_mode_2(currency, advanced)
-    with tab_mode_3:
-        calculate_mode_3(currency, advanced)
-    with tab_mode_4:
-        calculate_mode_4(currency, advanced)
-    with tab_mode_5:
-        calculate_mode_5(currency)
-
-    # --- Юридический футер (i18n): копирайт и товарные знаки Valve ---
+    render_purchase()
     st.divider()
-    st.markdown(
-        "<div style='text-align: center; color: gray; font-size: 0.8em;'>"
-        + _("© 2026 Yev Capital. Not affiliated with Valve Corp. "
-            "Steam and CS2 are trademarks of Valve Corporation.")
-        + "</div>",
-        unsafe_allow_html=True,
-    )
+    render_sell_from_holdings(deals)
+    st.divider()
+    render_ledger(deals)
+    st.divider()
+    render_delete(deals)
+    st.divider()
+    render_summary(deals)
+    st.divider()
+    render_export(deals)
 
 
 if __name__ == "__main__":
