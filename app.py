@@ -67,9 +67,9 @@ BACKUP_KEEP_MANUAL = 4           # сколько последних ручны�
 BACKUP_PREFIX = "deals.db."      # имя копии: deals.db.YYYY-MM-DD.bak
 BACKUP_SUFFIX = ".bak"
 
-DEFAULT_DEPOSIT_PROFIT = 47.0   # чистый плюс пополнения Steam, %
+DEFAULT_DEPOSIT_PROFIT = 48.0   # чистый плюс пополнения Steam, %
 DEFAULT_SALES_FEE = 2.0         # комиссия сайта за продажу, %
-DEFAULT_RATE = 45.25            # сколько ₴ в 1 $
+DEFAULT_RATE = 45.05            # сколько ₴ в 1 $
 
 # Поля ввода, видимые в журнале (два отдельных курса вместо одного).
 INPUT_COLUMNS = [
@@ -89,8 +89,60 @@ PURCHASE_FIELDS = ["item_name", "buy_date", "steam_buy_price", "deposit_profit_p
 DB_FIELDS = [
     "item_name", "buy_date", "steam_buy_price", "quantity", "deposit_profit_pct",
     "buy_uah_per_usd", "sold", "sell_date", "site_sell_price", "sales_fee_pct",
-    "sell_uah_per_usd", "lot_group",
+    "sell_uah_per_usd", "lot_group", "sold_at",
 ]
+
+# Формат отметки времени ЗАПИСИ продажи (sold_at). Это НЕ дата продажи (её вводит
+# пользователь), а момент, когда продажа внесена в журнал: только он позволяет
+# ответить «что продал последним» и «на чём остановился», если за один день
+# записано несколько продаж.
+SOLD_AT_FMT = "%Y-%m-%d %H:%M:%S"
+
+# --- ЕДИНЫЙ ФОРМАТ ОБМЕНА (экспорт CSV == импорт CSV) --------------------------
+# Сырые поля — источник истины: только они читаются при импорте.
+CSV_RAW_COLUMNS = [
+    ("id",                 "id"),
+    ("item_name",          "Предмет"),
+    ("buy_date",           "Дата покупки"),
+    ("steam_buy_price",    "Цена покупки ₴/шт"),
+    ("quantity",           "Количество"),
+    ("deposit_profit_pct", "Выгода пополнения %"),
+    ("buy_uah_per_usd",    "Курс покупки ₴/$"),
+    ("sold",               "Продано"),
+    ("sell_date",          "Дата продажи"),
+    ("site_sell_price",    "Цена продажи $/шт"),
+    ("sales_fee_pct",      "Комиссия продажи %"),
+    ("sell_uah_per_usd",   "Курс продажи ₴/$"),
+    ("lot_group",          "Группа партии"),
+    ("sold_at",            "Записано (продажа)"),
+]
+# Расчётные колонки — только для чтения глазами. При импорте ИГНОРИРУЮТСЯ и
+# пересчитываются из сырых полей: править их в файле бессмысленно.
+CSV_CALC_COLUMNS = [
+    ("real_cost_uah", "Себестоимость ₴ (расчёт)"),
+    ("profit_uah",    "Прибыль ₴ (расчёт)"),
+    ("profit_usd",    "Прибыль $ (расчёт)"),
+    ("roi_pct",       "ROI % (расчёт)"),
+    ("holding_days",  "Дней в холде (расчёт)"),
+    ("status",        "Статус (расчёт)"),
+]
+# Заголовок -> поле. Принимаются и русские заголовки экспорта, и сырые имена полей
+# (на случай, если файл собран вручную/скриптом). Плюс устаревший единый курс.
+IMPORT_HEADER_MAP = {}
+for _f, _ru in CSV_RAW_COLUMNS:
+    IMPORT_HEADER_MAP[_ru.strip().lower()] = _f
+    IMPORT_HEADER_MAP[_f.strip().lower()] = _f
+IMPORT_HEADER_MAP["uah_per_usd"] = "uah_per_usd"   # старая одно-курсовая схема
+# Терпимость к варианту заголовка с запятой перед единицей («Цена покупки, ₴/шт»):
+# так его может сохранить другая программа или написать человек.
+for _f, _ru in CSV_RAW_COLUMNS:
+    if " " in _ru:
+        _head, _unit = _ru.rsplit(" ", 1)
+        if any(ch in _unit for ch in "₴$%/"):
+            IMPORT_HEADER_MAP[f"{_head}, {_unit}".strip().lower()] = _f
+
+MAX_IMPORT_BYTES = 5 * 1024 * 1024   # 5 МБ — защита от «файла-бомбы»
+MAX_IMPORT_ROWS = 20000              # разумный предел строк
 
 
 # ===========================================================================
@@ -263,6 +315,29 @@ def _to_iso(value):
     return d.isoformat() if d else ""
 
 
+def _csv_safe_text(value):
+    """Обезвреживает текст перед записью в CSV (защита от инъекции формул).
+
+    Excel/LibreOffice исполняют ячейку, начинающуюся с =, +, - или @, как ФОРМУЛУ.
+    Название предмета вводит человек, поэтому перед выгрузкой такие ячейки
+    предваряются апострофом: файл остаётся текстом и ничего не выполняет.
+    Обратная операция (_csv_unquote) делает обмен полностью обратимым.
+    """
+    s = str(value if value is not None else "")
+    return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+
+
+def _csv_unquote(value):
+    """Снимает защитный апостроф, добавленный при экспорте (обратимость обмена)."""
+    s = str(value if value is not None else "")
+    return s[1:] if s[:1] == "'" and s[1:2] in ("=", "+", "-", "@") else s
+
+
+def now_stamp():
+    """Текущий момент как строка для sold_at (локальное время машины)."""
+    return datetime.now().strftime(SOLD_AT_FMT)
+
+
 # ===========================================================================
 # БАЗА ДАННЫХ (SQLite): стабильные id, точечные правки, авто-миграция
 # ===========================================================================
@@ -300,7 +375,8 @@ def init_db():
                 site_sell_price     REAL    NOT NULL DEFAULT 0,
                 sales_fee_pct       REAL    NOT NULL DEFAULT 0,
                 sell_uah_per_usd    REAL    NOT NULL DEFAULT 0,
-                lot_group           TEXT    NOT NULL DEFAULT ''
+                lot_group           TEXT    NOT NULL DEFAULT '',
+                sold_at             TEXT    NOT NULL DEFAULT ''
             )
             """
         )
@@ -312,6 +388,11 @@ def init_db():
             conn.execute("ALTER TABLE deals ADD COLUMN buy_uah_per_usd REAL NOT NULL DEFAULT 0")
         if "sell_uah_per_usd" not in cols:
             conn.execute("ALTER TABLE deals ADD COLUMN sell_uah_per_usd REAL NOT NULL DEFAULT 0")
+        if "sold_at" not in cols:
+            # Момент ЗАПИСИ продажи. Старым закрытым партиям остаётся пусто: когда
+            # их вносили — неизвестно, и выдумывать это нельзя.
+            conn.execute("ALTER TABLE deals ADD COLUMN sold_at TEXT NOT NULL DEFAULT ''")
+            conn.commit()
         if "lot_group" not in cols:
             conn.execute("ALTER TABLE deals ADD COLUMN lot_group TEXT NOT NULL DEFAULT ''")
             conn.commit()
@@ -566,10 +647,16 @@ def _normalize_deal(d):
         sell_date_val = ""
         site_sell_val = 0.0
         sales_fee_val = 0.0
+        sold_at_val = ""          # партия снова открыта -> отметка записи не нужна
     else:
         sell_date_val = _to_iso(d.get("sell_date", ""))
         site_sell_val = max(0.0, _to_float(d.get("site_sell_price"), 0.0))
         sales_fee_val = max(0.0, _to_float(d.get("sales_fee_pct"), 0.0))
+        # sold_at ПЕРЕНОСИТСЯ как есть и здесь НЕ выдумывается: функция остаётся
+        # чистой (без обращения к часам). Отметку ставят места, где продажа реально
+        # записывается (форма продажи, покупка «уже продано», правка журнала);
+        # при импорте берётся значение из файла.
+        sold_at_val = str(_num(d.get("sold_at"), "") or "").strip()
     return {
         "item_name": str(_num(d.get("item_name"), "") or "").strip(),
         "buy_date": _to_iso(d.get("buy_date", "")),
@@ -588,16 +675,30 @@ def _normalize_deal(d):
         "sales_fee_pct": sales_fee_val,
         "sell_uah_per_usd": sell_rate,
         "lot_group": str(_num(d.get("lot_group"), "") or "").strip(),
+        "sold_at": sold_at_val,
     }
 
 
 _INSERT_SQL = """
     INSERT INTO deals (item_name, buy_date, steam_buy_price, quantity,
                        deposit_profit_pct, buy_uah_per_usd, sold, sell_date,
-                       site_sell_price, sales_fee_pct, sell_uah_per_usd, lot_group)
+                       site_sell_price, sales_fee_pct, sell_uah_per_usd, lot_group,
+                       sold_at)
     VALUES (:item_name, :buy_date, :steam_buy_price, :quantity,
             :deposit_profit_pct, :buy_uah_per_usd, :sold, :sell_date,
-            :site_sell_price, :sales_fee_pct, :sell_uah_per_usd, :lot_group)
+            :site_sell_price, :sales_fee_pct, :sell_uah_per_usd, :lot_group,
+            :sold_at)
+"""
+
+_INSERT_SQL_WITH_ID = """
+    INSERT INTO deals (id, item_name, buy_date, steam_buy_price, quantity,
+                       deposit_profit_pct, buy_uah_per_usd, sold, sell_date,
+                       site_sell_price, sales_fee_pct, sell_uah_per_usd, lot_group,
+                       sold_at)
+    VALUES (:id, :item_name, :buy_date, :steam_buy_price, :quantity,
+            :deposit_profit_pct, :buy_uah_per_usd, :sold, :sell_date,
+            :site_sell_price, :sales_fee_pct, :sell_uah_per_usd, :lot_group,
+            :sold_at)
 """
 
 _UPDATE_SQL = """
@@ -606,7 +707,8 @@ _UPDATE_SQL = """
         quantity=:quantity, deposit_profit_pct=:deposit_profit_pct,
         buy_uah_per_usd=:buy_uah_per_usd, sold=:sold, sell_date=:sell_date,
         site_sell_price=:site_sell_price, sales_fee_pct=:sales_fee_pct,
-        sell_uah_per_usd=:sell_uah_per_usd, lot_group=:lot_group
+        sell_uah_per_usd=:sell_uah_per_usd, lot_group=:lot_group,
+        sold_at=:sold_at
     WHERE id=:id
 """
 
@@ -709,7 +811,7 @@ def apply_changes(updates, inserts, delete_ids):
 
 
 def replace_lot_with_sale(deals, lot_id, sell_qty, sell_date_iso,
-                          site_sell_price, sales_fee_pct, sell_rate):
+                          site_sell_price, sales_fee_pct, sell_rate, sold_at=None):
     """Оформляет продажу части открытой партии через ТОЧЕЧНЫЕ правки по id.
 
     Возвращает (updates, inserts, delete_ids) для apply_changes:
@@ -735,6 +837,8 @@ def replace_lot_with_sale(deals, lot_id, sell_qty, sell_date_iso,
         **pf, "quantity": q, "sold": 1, "sell_date": sell_date_iso,
         "site_sell_price": site_sell_price, "sales_fee_pct": sales_fee_pct,
         "sell_uah_per_usd": sell_rate,
+        # Момент записи продажи: по нему строится история «что продал последним».
+        "sold_at": sold_at or now_stamp(),
     })
     sold_lot["id"] = lot_id  # переиспользуем существующий id (UPDATE)
 
@@ -751,7 +855,17 @@ def replace_lot_with_sale(deals, lot_id, sell_qty, sell_date_iso,
 # СОПОСТАВЛЕНИЕ ПРАВОК РЕДАКТОРА С id (для точечного сохранения)
 # ===========================================================================
 
-def diff_editor_state(original_deals, editor_state):
+def _stamp_if_new_sale(row, stamp):
+    """Ставит отметку записи продажи, если строка помечена «Продано», а отметки нет.
+
+    Уже имеющийся sold_at НЕ перезаписывается: правка цены/даты у давно проданной
+    партии не должна выдавать её за «только что проданную».
+    """
+    if _to_bool(row.get("sold")) and not str(row.get("sold_at") or "").strip():
+        row["sold_at"] = stamp
+
+
+def diff_editor_state(original_deals, editor_state, stamp=None):
     """Преобразует состояние st.data_editor в (updates, inserts, delete_ids).
 
     original_deals — список партий В ТОМ ЖЕ порядке, в каком строки поданы в
@@ -761,7 +875,13 @@ def diff_editor_state(original_deals, editor_state):
 
     Пустые/частично пустые добавленные строки отсекаются (нужны название или
     положительная цена покупки).
+
+    sold_at: строки, которые в редакторе ТОЛЬКО ЧТО стали проданными (галочка
+    «Продано») и не имеют отметки записи, получают её. У уже проданных строк
+    отметка сохраняется — она приходит из исходной записи БД и не затирается
+    при правке других полей.
     """
+    stamp = stamp or now_stamp()
     edited = editor_state.get("edited_rows", {}) or {}
     added = editor_state.get("added_rows", []) or []
     deleted = editor_state.get("deleted_rows", []) or []
@@ -791,6 +911,7 @@ def diff_editor_state(original_deals, editor_state):
             if not _meaningful_row(base):
                 cleared_delete_ids.append(int(original_deals[pos]["id"]))
             else:
+                _stamp_if_new_sale(base, stamp)
                 updates.append(base)
         else:
             # Правка строки за пределами исходных данных = добавленная строка.
@@ -803,6 +924,8 @@ def diff_editor_state(original_deals, editor_state):
         if _meaningful_row(row):
             inserts.append(row)
     inserts.extend(edited_as_inserts)
+    for row in inserts:
+        _stamp_if_new_sale(row, stamp)
 
     # Очищенные существующие строки удаляем (без дублей с явными удалениями).
     for did in cleared_delete_ids:
@@ -1113,6 +1236,278 @@ def _delta_str(roi):
 # UI: ПОКУПКА (создание партии; опционально — часть/всё уже продано)
 # ===========================================================================
 
+# ===========================================================================
+# ОБМЕН ДАННЫМИ: ЭКСПОРТ И ИМПОРТ (ОДИН ФОРМАТ, ОДНИ ПРАВИЛА)
+# ===========================================================================
+
+def build_export_df(deals):
+    """DataFrame единого формата обмена: сырые поля + расчётные (справочные).
+
+    Сырые поля идут из БД как есть (включая id, группу партии и отметку записи
+    продажи) — именно они читаются при импорте. Расчётные колонки берутся из того
+    же build_dataframe, что и журнал, и при импорте игнорируются.
+    """
+    calc = build_dataframe(deals).set_index("_id")
+    records = []
+    for d in deals:
+        row = {}
+        for field, header in CSV_RAW_COLUMNS:
+            val = d.get(field, "")
+            if field in ("item_name", "lot_group", "sold_at"):
+                val = _csv_safe_text(val)
+            row[header] = val
+        rid = d.get("id")
+        for field, header in CSV_CALC_COLUMNS:
+            try:
+                row[header] = calc.at[rid, field] if rid in calc.index else None
+            except KeyError:
+                row[header] = None
+        records.append(row)
+    columns = [h for _f, h in CSV_RAW_COLUMNS] + [h for _f, h in CSV_CALC_COLUMNS]
+    if not records:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in columns})
+    return pd.DataFrame(records, columns=columns)
+
+
+def parse_import_csv(data):
+    """Разбирает CSV импорта в нормализованные партии + отчёт для предпросмотра.
+
+    БЕЗОПАСНОСТЬ: файл — это ДАННЫЕ, а не код. Ничего не выполняется и не
+    вычисляется из файла: значения только парсятся pandas и приводятся теми же
+    функциями (_to_float/_to_int/_to_bool/_normalize_deal), что и ручной ввод.
+    Ограничены размер файла и число строк. Неизвестные и расчётные колонки
+    игнорируются. Проверка — та же validate_deals, что и для журнала.
+
+    Возвращает (rows, report). report: total / ready / skipped / warnings /
+    ignored_columns либо error (тогда rows пуст).
+    """
+    if not data:
+        return [], {"error": "Файл пустой."}
+    if len(data) > MAX_IMPORT_BYTES:
+        return [], {"error": f"Файл больше {MAX_IMPORT_BYTES // (1024 * 1024)} МБ — импорт отклонён."}
+    try:
+        df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False,
+                         encoding="utf-8-sig")
+    except Exception as exc:
+        return [], {"error": f"Не удалось прочитать CSV: {exc}"}
+    if len(df) > MAX_IMPORT_ROWS:
+        return [], {"error": f"Слишком много строк ({len(df)}), предел — {MAX_IMPORT_ROWS}."}
+
+    mapping = {}
+    for col in df.columns:
+        field = IMPORT_HEADER_MAP.get(str(col).strip().lower())
+        if field:
+            mapping[col] = field
+    if not ({"item_name", "buy_date", "steam_buy_price"} & set(mapping.values())):
+        return [], {"error": "В файле нет колонок журнала (нужны «Предмет», «Дата покупки» "
+                             "или «Цена покупки»). Похоже, это не файл экспорта."}
+
+    rows, skipped = [], 0
+    for _idx, r in df.iterrows():
+        raw = {}
+        for col, field in mapping.items():
+            val = r[col]
+            if field in ("item_name", "lot_group", "sold_at"):
+                val = _csv_unquote(val)
+            raw[field] = val
+        if not _meaningful_row(raw):
+            skipped += 1
+            continue
+        row = _normalize_deal(raw)
+        rid = _to_int(raw.get("id"), 0)
+        if rid > 0:
+            row["id"] = rid
+        rows.append(row)
+
+    report = {
+        "total": int(len(df)),
+        "ready": len(rows),
+        "skipped": skipped,
+        "warnings": validate_deals(rows),
+        "ignored_columns": [str(c) for c in df.columns if c not in mapping],
+    }
+    return rows, report
+
+
+def import_deals(rows, mode="append"):
+    """Записывает импортированные партии в ОДНОЙ транзакции (всё или ничего).
+
+        mode='replace' — ПОЛНАЯ ПЕРЕЗАПИСЬ: таблица очищается, затем пишутся строки
+            файла. id из файла сохраняются, только если они корректны и уникальны у
+            ВСЕХ строк; иначе id назначает база (так не возникнет коллизий).
+        mode='append'  — ДОБАВЛЕНИЕ: id из файла игнорируются (их назначит база), а
+            метки групп получают префикс импорта. Без префикса группа из файла
+            (например 'id:5') могла бы совпасть с существующей, и сверка покупок
+            склеила бы чужие партии в одну.
+
+    Дубликаты не отсеиваются — строки записываются как есть. При любой ошибке
+    выполняется откат: база остаётся в прежнем состоянии.
+    """
+    conn = get_conn()
+    try:
+        if mode == "replace":
+            ids = [_to_int(r.get("id"), 0) for r in rows]
+            keep_ids = bool(rows) and all(i > 0 for i in ids) and len(set(ids)) == len(ids)
+            conn.execute("DELETE FROM deals")
+            for r in rows:
+                payload = _normalize_deal(r)
+                if keep_ids:
+                    payload["id"] = _to_int(r.get("id"), 0)
+                    conn.execute(_INSERT_SQL_WITH_ID, payload)
+                    rid = payload["id"]
+                else:
+                    rid = conn.execute(_INSERT_SQL, payload).lastrowid
+                if not payload.get("lot_group"):
+                    conn.execute("UPDATE deals SET lot_group = ? WHERE id = ?", (f"id:{rid}", rid))
+        else:
+            base = conn.execute("SELECT COALESCE(MAX(id), 0) FROM deals").fetchone()[0]
+            tag = f"imp{_to_int(base, 0) + 1}"
+            for r in rows:
+                payload = _normalize_deal(r)
+                group = payload.get("lot_group")
+                if group:
+                    payload["lot_group"] = f"{tag}:{group}"
+                rid = conn.execute(_INSERT_SQL, payload).lastrowid
+                if not payload.get("lot_group"):
+                    conn.execute("UPDATE deals SET lot_group = ? WHERE id = ?", (f"id:{rid}", rid))
+        conn.commit()
+        return len(rows)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ===========================================================================
+# ИСТОРИЯ ПРОДАЖ
+# ===========================================================================
+
+def sold_lots(deals):
+    """Закрытые партии (отмечены как «Продано»)."""
+    return [d for d in deals if _to_bool(d.get("sold"))]
+
+
+def sale_record_sort_key(d):
+    """Порядок ЗАПИСИ продажи: сначала отметка sold_at, затем дата продажи, затем id.
+
+    Записи без sold_at (внесённые до появления поля) идут ниже всех записей с
+    отметкой: они были сделаны раньше, а их порядок внутри дня достоверно
+    неизвестен — выдумывать его нельзя.
+    """
+    stamp = str(d.get("sold_at") or "").strip()
+    return (1 if stamp else 0, stamp,
+            (_parse_iso(d.get("sell_date")) or date.min).isoformat(),
+            int(d.get("id") or 0))
+
+
+def sale_date_sort_key(d):
+    """Порядок по ДАТЕ продажи (бизнес-хронология), затем по моменту записи и id."""
+    return ((_parse_iso(d.get("sell_date")) or date.min).isoformat(),
+            str(d.get("sold_at") or "").strip(),
+            int(d.get("id") or 0))
+
+
+def sale_row(d):
+    """Строка истории по закрытой партии.
+
+    Деньги считаются тем же compute_deal, что и журнал/сводка, и по тем же
+    правилам: прибыль и ROI показываются только для ПОЛНОЙ продажи (есть цена и
+    дата), долларовая прибыль — только при известном курсе покупки, а битое
+    количество (<1) обнуляет расчётные колонки. Иначе история противоречила бы
+    сводке.
+    """
+    qty = _to_int(d.get("quantity"), 0)
+    buy_rate = _to_float(d.get("buy_uah_per_usd"))
+    sell_rate_raw = _to_float(d.get("sell_uah_per_usd"))
+    sell_rate_arg = sell_rate_raw if sell_rate_raw > 0 else (buy_rate if buy_rate > 0 else None)
+    calc = compute_deal(
+        steam_buy_price=d.get("steam_buy_price", 0.0), quantity=qty,
+        deposit_profit_pct=d.get("deposit_profit_pct", 0.0),
+        buy_uah_per_usd=buy_rate, sell_uah_per_usd=sell_rate_arg, sold=True,
+        site_sell_price=d.get("site_sell_price", 0.0),
+        sales_fee_pct=d.get("sales_fee_pct", 0.0),
+    )
+    price = _to_float(d.get("site_sell_price"), 0.0)
+    sell_d = _parse_iso(d.get("sell_date"))
+    complete = price > 0 and sell_d is not None
+    qty_ok = qty >= 1
+    usd_defined = complete and buy_rate > 0
+    roi = calc["roi_pct"]
+    return {
+        "Предмет": str(d.get("item_name") or "").strip() or "(без названия)",
+        "Кол-во": qty,
+        "Дата продажи": sell_d.isoformat() if sell_d else "—",
+        "Записано": str(d.get("sold_at") or "").strip() or "—",
+        "Цена продажи, $/шт": round(price, 2) if price > 0 else None,
+        "Выручка, $": round(calc["revenue_usd"], 2) if (complete and qty_ok) else None,
+        "Прибыль, $": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
+        "Прибыль, ₴": round(calc["profit_uah"], 2) if (complete and qty_ok) else None,
+        "ROI, %": round(roi, 1) if (complete and qty_ok and roi is not None) else None,
+        "Курс продажи": round(sell_rate_raw, 2) if sell_rate_raw > 0 else None,
+        "Статус": "Закрыта" if complete else "Закрыта (неполная)",
+    }
+
+
+def render_sales_history(deals):
+    """История продаж: что продано последним и в каком порядке это записывалось."""
+    st.subheader("📜 История продаж")
+    sold = sold_lots(deals)
+    if not sold:
+        st.info("Продаж пока нет. Здесь появится список закрытых партий — от последней записи к первой.")
+        return
+
+    by_record = sorted(sold, key=sale_record_sort_key, reverse=True)
+    by_date = sorted(sold, key=sale_date_sort_key, reverse=True)
+    last = by_record[0]
+    last_name = str(last.get("item_name") or "").strip() or "(без названия)"
+    last_stamp = str(last.get("sold_at") or "").strip()
+    last_sell = _parse_iso(last.get("sell_date"))
+    st.success(
+        f"**На чём остановился:** последняя запись — **{last_name}** · "
+        f"{_to_int(last.get('quantity'), 0)} шт · дата продажи "
+        f"{last_sell.isoformat() if last_sell else '—'} · "
+        + (f"записано {last_stamp}" if last_stamp else "без отметки времени (старая запись)")
+    )
+    # Самая свежая ПО ДАТЕ продажи может быть другой партией (продажу могли внести
+    # задним числом) — тогда показываем и её, чтобы не запутаться.
+    newest = by_date[0]
+    if newest.get("id") != last.get("id"):
+        n_name = str(newest.get("item_name") or "").strip() or "(без названия)"
+        n_date = _parse_iso(newest.get("sell_date"))
+        st.caption(f"Самая свежая по дате продажи — другая партия: {n_name} "
+                   f"({n_date.isoformat() if n_date else '—'}).")
+
+    c1, c2, c3 = st.columns([2, 2, 1])
+    order = c1.radio("Порядок", ["По порядку записи", "По дате продажи"],
+                     horizontal=True, key="hist_order")
+    names = sorted({str(d.get("item_name") or "").strip() or "(без названия)" for d in sold})
+    item = c2.selectbox("Предмет", ["Все предметы"] + names, key="hist_item")
+    limit_label = c3.selectbox("Показать", ["10", "25", "50", "все"], key="hist_limit")
+
+    view = by_record if order == "По порядку записи" else by_date
+    if item != "Все предметы":
+        view = [d for d in view
+                if (str(d.get("item_name") or "").strip() or "(без названия)") == item]
+    total = len(view)
+    if limit_label != "все":
+        view = view[:int(limit_label)]
+
+    rows = []
+    for i, d in enumerate(view, start=1):
+        rows.append({"№": i, **sale_row(d)})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption(f"Показано {len(view)} из {total} закрытых партий. "
+               "«Записано» — момент внесения продажи в журнал: именно по нему видно, "
+               "на чём ты остановился (дату продажи можно поставить задним числом).")
+
+    legacy = sum(1 for d in sold if not str(d.get("sold_at") or "").strip())
+    if legacy:
+        st.caption(f"⚠️ У {legacy} записей нет отметки времени — они внесены до появления "
+                   "этого поля. Их порядок внутри дня достоверно неизвестен, поэтому в "
+                   "режиме «по порядку записи» они идут в конце.")
+
+
 def render_purchase():
     """Запись покупки. Создаёт открытую партию (остаток на руках)."""
     st.subheader("➕ Покупка")
@@ -1196,7 +1591,8 @@ def render_purchase():
                 # общей группой (insert_deals_atomic назначит её по id первой части).
                 lots = [{**purchase, "quantity": will_sell, "sold": 1,
                          "sell_date": _to_iso(sell_d), "site_sell_price": float(site_price),
-                         "sales_fee_pct": float(sales_fee), "sell_uah_per_usd": float(sell_rate)}]
+                         "sales_fee_pct": float(sales_fee), "sell_uah_per_usd": float(sell_rate),
+                         "sold_at": now_stamp()}]
                 remaining = int(qty_bought) - will_sell
                 if remaining > 0:
                     lots.append({**purchase, "quantity": remaining, "sold": 0, "sell_date": "",
@@ -1603,8 +1999,91 @@ def render_summary(deals):
 # UI: ЭКСПОРТ
 # ===========================================================================
 
+def _run_import(rows, mode):
+    """Безопасный запуск импорта: сначала резервная копия, затем запись одной
+    транзакцией. Если бэкап не удался — импорт вообще не начинается."""
+    try:
+        backup_path = make_backup(force=True, manual=True)
+    except Exception as exc:
+        st.error(f"Не удалось создать резервную копию — импорт отменён, база не тронута: {exc}")
+        return
+    try:
+        written = import_deals(rows, mode=mode)
+    except Exception as exc:
+        st.error(f"Импорт не выполнен, база осталась прежней (откат транзакции): {exc}")
+        return
+    note = f" · резервная копия: {Path(backup_path).name}" if backup_path else ""
+    st.success(f"Импортировано строк: {written}{note}")
+    st.rerun()
+
+
+def render_import():
+    """Импорт журнала из CSV: полная перезапись или добавление.
+
+    Рисуется всегда (в том числе при пустой базе) — это основной путь
+    восстановления данных из файла.
+    """
+    st.subheader("📥 Импорт из CSV")
+    st.caption("Принимается файл кнопки «Скачать CSV» (или свой с такими же колонками). "
+               "Читаются только сырые поля; расчётные колонки игнорируются и "
+               "пересчитываются. Проверки — те же, что и при ручном вводе.")
+
+    uploaded = st.file_uploader("Файл CSV", type=["csv"], key="imp_file",
+                               help="Только CSV. Excel-файл не принимается.")
+    if uploaded is None:
+        return
+
+    rows, report = parse_import_csv(uploaded.getvalue())
+    if report.get("error"):
+        st.error(report["error"])
+        return
+
+    st.info(f"Строк в файле: {report['total']} · к записи: {report['ready']} · "
+            f"пропущено пустых: {report['skipped']}")
+    if report.get("ignored_columns"):
+        st.caption("Игнорируются колонки (расчётные/неизвестные): "
+                   + ", ".join(report["ignored_columns"]))
+    if not rows:
+        st.warning("Нечего импортировать: не найдено ни одной осмысленной строки.")
+        return
+
+    with st.expander(f"👁 Предпросмотр (первые 20 из {len(rows)})"):
+        st.dataframe(pd.DataFrame(rows[:20]), use_container_width=True, hide_index=True)
+
+    warnings_list = report.get("warnings") or []
+    if warnings_list:
+        with st.expander(f"⚠️ Предупреждения проверки ({len(warnings_list)})"):
+            for w in warnings_list[:50]:
+                st.write("• " + str(w))
+            if len(warnings_list) > 50:
+                st.caption(f"…и ещё {len(warnings_list) - 50}.")
+        st.caption("Это те же проверки, что и для журнала. Импортировать можно, "
+                   "но такие записи стоит поправить.")
+
+    mode_label = st.radio("Режим импорта",
+                          ["Заменить всё (перезапись базы)", "Добавить к текущим"],
+                          key="imp_mode")
+    replace_mode = mode_label.startswith("Заменить")
+
+    if replace_mode:
+        st.error("Перезапись УДАЛИТ все текущие записи и заменит их содержимым файла. "
+                 "Резервная копия создаётся автоматически перед записью.")
+        confirmed = st.checkbox("Понимаю: текущие записи будут удалены", key="imp_confirm")
+        if st.button("♻️ Заменить всё данными из файла", type="primary", key="imp_run_replace",
+                     disabled=not confirmed, use_container_width=True):
+            _run_import(rows, "replace")
+    else:
+        st.caption("Строки добавятся КАК ЕСТЬ (дубликаты не отсеиваются). id из файла "
+                   "игнорируются, а группы партий переименовываются — чтобы импорт не "
+                   "склеился с уже существующими покупками.")
+        if st.button("➕ Добавить строки в журнал", key="imp_run_append",
+                     use_container_width=True):
+            _run_import(rows, "append")
+
+
 def render_export(deals):
-    """Выгрузка журнала в CSV и Excel для бэкапа/внешнего просмотра."""
+    """Выгрузка журнала: CSV (единый формат обмена — его же читает импорт) и Excel
+    (только для просмотра/печати)."""
     if not deals:
         return
     st.subheader("💾 Экспорт")
@@ -1615,9 +2094,12 @@ def render_export(deals):
 
     col_csv, col_xlsx = st.columns(2)
     with col_csv:
-        csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Скачать CSV", data=csv_bytes, file_name="steam_ledger.csv",
-                           mime="text/csv", use_container_width=True)
+        # CSV — ЕДИНЫЙ формат обмена: содержит сырые поля (id, группа партии,
+        # отметка записи продажи), поэтому этот же файл принимает импорт.
+        csv_bytes = build_export_df(deals).to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Скачать CSV (для импорта)", data=csv_bytes,
+                           file_name="steam_ledger.csv", mime="text/csv",
+                           use_container_width=True)
     with col_xlsx:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -1625,6 +2107,9 @@ def render_export(deals):
         st.download_button("⬇️ Скачать Excel", data=buffer.getvalue(), file_name="steam_ledger.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True)
+    st.caption("CSV — полный формат обмена (сырые поля + расчётные колонки; расчётные "
+               "при импорте игнорируются и пересчитываются). Excel — только для просмотра, "
+               "импортировать его нельзя.")
     st.caption(f"База данных хранится локально: {DB_PATH.name} (рядом с приложением).")
 
     # --- Резервные копии ---
@@ -1770,6 +2255,8 @@ def main():
     st.divider()
     render_sell_from_holdings(deals)
     st.divider()
+    render_sales_history(deals)
+    st.divider()
     render_ledger(deals)
     st.divider()
     render_delete(deals)
@@ -1777,6 +2264,8 @@ def main():
     render_summary(deals)
     st.divider()
     render_export(deals)
+    st.divider()
+    render_import()
 
 
 if __name__ == "__main__":
