@@ -195,9 +195,22 @@ def _to_float(value, default=0.0):
     if isinstance(raw, str):
         txt = raw.strip().replace("\u00a0", "").replace(" ", "")
         if "," in txt and "." in txt:
-            txt = txt.replace(",", "")      # запятая = разделитель разрядов
+            # Десятичный разделитель — тот, что стоит ПОСЛЕДНИМ; второй разделяет разряды.
+            # «1,234.56» -> 1234.56 (США); «1.234,56» -> 1234.56 (Европа).
+            if txt.rfind(",") > txt.rfind("."):
+                txt = txt.replace(".", "").replace(",", ".")
+            else:
+                txt = txt.replace(",", "")
         elif "," in txt:
-            txt = txt.replace(",", ".")     # запятая = десятичный разделитель
+            head, _sep, tail = txt.rpartition(",")
+            # Ровно три цифры после единственной запятой при цифрах перед ней — это
+            # разряды («1,250» = 1250), а не дробь. Иначе запятая десятичная
+            # («100,50» -> 100.5) — так пишет Excel в украинской локали.
+            if (len(tail) == 3 and tail.isdigit()
+                    and head.replace(",", "").lstrip("-").isdigit()):
+                txt = txt.replace(",", "")
+            else:
+                txt = txt.replace(",", ".")
         raw = txt
     try:
         val = float(raw)
@@ -343,10 +356,17 @@ def _parse_iso(value):
             return value.date()
     except Exception:
         pass
-    try:
-        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return None
+    # Кроме ISO принимаем локальные форматы: Excel в украинской/русской локали
+    # сохраняет даты как 14.07.2026, и без этого при импорте они молча становились бы
+    # пустыми (терялась история покупок и расчёт дней удержания).
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d",
+                "%d.%m.%y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _to_iso(value):
@@ -949,6 +969,22 @@ def sale_data_without_flag(updates, inserts, originals_by_id):
     return bad
 
 
+def reopened_sold_lots(updates, originals_by_id):
+    """Партии, у которых в редакторе СНЯЛИ галочку «Продано».
+
+    Это необратимо: _normalize_deal очистит цену, дату, комиссию и курс продажи, а
+    также отметку записи (sold_at). Пользователь должен подтвердить это осознанно,
+    поэтому такие строки возвращаются для предупреждения ДО сохранения.
+    """
+    reopened = []
+    for row in updates:
+        original = originals_by_id.get(row.get("id")) or {}
+        if _to_bool(original.get("sold")) and not _to_bool(row.get("sold")):
+            reopened.append(str(original.get("item_name") or "").strip()
+                            or f"#{row.get('id')}")
+    return reopened
+
+
 def diff_editor_state(original_deals, editor_state, stamp=None):
     """Преобразует состояние st.data_editor в (updates, inserts, delete_ids).
 
@@ -970,11 +1006,18 @@ def diff_editor_state(original_deals, editor_state, stamp=None):
     added = editor_state.get("added_rows", []) or []
     deleted = editor_state.get("deleted_rows", []) or []
 
-    # Удаления -> id из исходного списка по позиции.
+    # Удаления. Позиция меньше длины исходного списка -> удаление существующей партии
+    # по id. Позиция ЗА его пределами -> это удалённая ТОЛЬКО ЧТО добавленная строка:
+    # Streamlit оставляет её в added_rows и одновременно кладёт позицию в deleted_rows,
+    # поэтому без явного отсева такая строка снова вставлялась бы в базу.
     delete_ids = []
+    dropped_added = set()
     for pos in deleted:
+        pos = int(pos)
         if 0 <= pos < len(original_deals):
             delete_ids.append(int(original_deals[pos]["id"]))
+        else:
+            dropped_added.add(pos - len(original_deals))
 
     # Изменения существующих строк -> применяем поверх исходных значений.
     # Если позиция выходит за пределы исходного списка (некоторые версии
@@ -1005,18 +1048,28 @@ def diff_editor_state(original_deals, editor_state, stamp=None):
     # Новые строки -> INSERT. Правки с позициями за пределами исходного списка
     # НАКЛАДЫВАЮТСЯ на соответствующую добавленную строку, а не вставляются отдельно:
     # иначе одна и та же новая строка сохранилась бы дважды (и в added, и как правка).
-    added_rows = [dict(row) for row in added]
+    kept = [i for i in range(len(added)) if i not in dropped_added]
+    added_rows = [dict(added[i]) for i in kept]
+    added_index_map = {orig: new for new, orig in enumerate(kept)}
     orphan_edits = []
     for pos, changes in sorted(edited_beyond.items()):
         idx = pos - len(original_deals)
-        if 0 <= idx < len(added_rows):
-            added_rows[idx].update(changes)
+        if idx in dropped_added:
+            continue                                  # строку удалили — правка не нужна
+        target = added_index_map.get(idx)
+        if target is not None:
+            added_rows[target].update(changes)
         else:
             orphan_edits.append(changes)
 
     inserts = [row for row in added_rows if _meaningful_row(row)]
     inserts.extend(row for row in orphan_edits if _meaningful_row(row))
     for row in inserts:
+        # У НОВОЙ строки пустое количество означает «одна штука», а не «ноль»: ноль
+        # сделал бы запись битой и выкинул её из всех расчётов. Очистку количества у
+        # СУЩЕСТВУЮЩЕЙ строки не трогаем — это осознанная правка.
+        if _is_blank(row.get("quantity")):
+            row["quantity"] = 1
         _stamp_if_new_sale(row, stamp)
 
     # Очищенные существующие строки удаляем (без дублей с явными удалениями).
@@ -1125,6 +1178,16 @@ def validate_deals(deals):
         if dep <= -100.0:
             warnings.append(f"«{name}»: чистый плюс {dep:g}% (≤ −100%) обнуляет себестоимость — "
                             "проверь значение, иначе прибыль и ROI будут неверны.")
+    # Комиссия > 100% сохраняется как есть (данные пользователя не подменяем), но в
+    # расчёте compute_deal она урезается до 100%. Без предупреждения это расхождение
+    # было бы незаметным.
+    for d in deals:
+        fee = _to_float(d.get("sales_fee_pct"), 0.0)
+        if fee > 100.0:
+            name = str(_num(d.get("item_name"), "") or "").strip() or "(без названия)"
+            warnings.append(f"«{name}»: комиссия {fee:g}% больше 100% — в расчёте "
+                            f"используется 100% (выручка обнуляется). Похоже на опечатку.")
+
     def _label(deal):
         name = str(_num(deal.get("item_name"), "") or "").strip() or "(без названия)"
         return f"#{deal.get('id')} {name}" if deal.get("id") else name
@@ -1735,7 +1798,13 @@ def render_purchase():
                             sold=True, site_sell_price=site_price, sales_fee_pct=sales_fee)
         c2.metric(f"Прибыль с продажи ({will_sell} шт)", f"{sale['profit_uah']:,.2f} ₴",
                   delta=_delta_str(sale["roi_pct"]))
-        c3.metric("Прибыль, $", f"{sale['profit_usd']:,.2f} $")
+        # Без курса покупки долларовая себестоимость = 0, и «прибыль в $» равнялась бы
+        # ВСЕЙ выручке. Показываем «н/д» вместо завышенной цифры.
+        if buy_rate > 0:
+            c3.metric("Прибыль, $", f"{sale['profit_usd']:,.2f} $")
+        else:
+            c3.metric("Прибыль, $", "н/д",
+                      help="Не задан курс покупки — долларовую прибыль посчитать не из чего.")
         remaining = int(qty_bought) - will_sell
         if remaining > 0:
             st.info(f"Будет создано: закрытая партия {will_sell} шт + открытый остаток {remaining} шт.")
@@ -1830,7 +1899,12 @@ def render_sell_from_holdings(deals):
     c1, c2, c3 = st.columns(3)
     c1.metric("Реальная стоимость", f"{sale['real_cost_uah']:,.2f} ₴", help=f"≈ {sale['real_cost_usd']:,.2f} $ по курсу покупки")
     c2.metric("Прибыль", f"{sale['profit_uah']:,.2f} ₴", delta=_delta_str(sale["roi_pct"]))
-    c3.metric("Прибыль, $", f"{sale['profit_usd']:,.2f} $")
+    # То же самое: без курса покупки $-прибыль была бы равна всей выручке.
+    if lot_buy_rate > 0:
+        c3.metric("Прибыль, $", f"{sale['profit_usd']:,.2f} $")
+    else:
+        c3.metric("Прибыль, $", "н/д",
+                  help="Не задан курс покупки — долларовую прибыль посчитать не из чего.")
     remaining = open_qty - int(sell_qty)
     if remaining > 0:
         st.caption(f"После продажи на руках останется {remaining} шт (открытая позиция).")
@@ -1907,12 +1981,18 @@ def _filter_and_sort_deals(deals, query, sort_mode):
     def _date_key(d):
         return (_parse_iso(d.get("buy_date")) or date.min, d.get("id", 0))
 
+    def _date_key_asc(d):
+        # При «старые сверху» партии БЕЗ даты не должны прыгать наверх: первый элемент
+        # ключа держит их внизу (True сортируется после False).
+        parsed = _parse_iso(d.get("buy_date"))
+        return (parsed is None, parsed or date.min, d.get("id", 0))
+
     if sort_mode == "Название (А→Я)":
         view.sort(key=_name_key)
     elif sort_mode == "Название (Я→А)":
         view.sort(key=_name_key, reverse=True)
     elif sort_mode == "Дата (старые сверху)":
-        view.sort(key=_date_key)
+        view.sort(key=_date_key_asc)
     else:  # 'Дата (новые сверху)' — по умолчанию
         view.sort(key=_date_key, reverse=True)
     return view
@@ -2012,6 +2092,18 @@ def render_ledger(deals):
     else:
         check_deals = preview_visible
 
+    # Снятие галочки «Продано» СТИРАЕТ данные продажи и отметку записи — необратимо.
+    # Поэтому предупреждаем и просим подтверждение ДО нажатия «Сохранить».
+    pending_state = st.session_state.get(editor_key, {}) or {}
+    pending_reopen = []
+    if pending_state:
+        _pu, _pi, _pd = diff_editor_state(view_deals, pending_state)
+        pending_reopen = reopened_sold_lots(_pu, {d.get("id"): d for d in view_deals})
+    if pending_reopen:
+        st.warning("Снятие галочки «Продано» удалит данные продажи (цена, дата, комиссия, "
+                   "курс и отметку записи) у: " + ", ".join(pending_reopen))
+        st.checkbox("Понимаю: данные продажи этих партий будут удалены", key="reopen_confirm")
+
     col_save, col_info = st.columns([1, 3])
     with col_save:
         if st.button("💾 Сохранить изменения", type="primary", use_container_width=True):
@@ -2023,7 +2115,10 @@ def render_ledger(deals):
             # «Продано» не стоит -> при записи они были бы стёрты. Не сохраняем.
             unflagged = sale_data_without_flag(updates, inserts,
                                                {d.get("id"): d for d in view_deals})
-            if unflagged:
+            if pending_reopen and not st.session_state.get("reopen_confirm"):
+                st.error("Не сохранено: снятие галочки «Продано» удалит данные продажи. "
+                         "Подтверди это галочкой выше или верни «Продано» на место.")
+            elif unflagged:
                 st.error("Не сохранено: у этих строк заполнены данные продажи, но не отмечено "
                          "«Продано» — иначе они были бы стёрты. Поставь галочку или очисти "
                          "поля продажи: " + ", ".join(unflagged))
@@ -2165,7 +2260,7 @@ def render_summary(deals):
     m2.metric("В остатках на руках", f"{open_cost_uah:,.2f} ₴")
     m2.caption(f"{qty_open} шт в {len(open_pos)} открытых партиях")
     m3.metric("Доля прибыльных", f"{win_rate:.0f}%")
-    m3.caption(f"{wins} из {len(closed)} завершённых продаж")
+    m3.caption(f"{wins} из {len(closed_uah)} завершённых продаж с известным курсом")
 
     if not incomplete.empty:
         st.warning(f"Не учтено в итогах: {len(incomplete)} партий отмечены проданными, но без цены "
