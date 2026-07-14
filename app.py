@@ -45,6 +45,7 @@ Yev Steam Trading Ledger — журнал сделок со скинами CS2
 """
 
 import io
+import math
 import os
 from collections import defaultdict
 from datetime import date, datetime
@@ -126,20 +127,33 @@ CSV_CALC_COLUMNS = [
     ("holding_days",  "Дней в холде (расчёт)"),
     ("status",        "Статус (расчёт)"),
 ]
-# Заголовок -> поле. Принимаются и русские заголовки экспорта, и сырые имена полей
-# (на случай, если файл собран вручную/скриптом). Плюс устаревший единый курс.
+# Заголовок -> поле. Сопоставление идёт по НОРМАЛИЗОВАННОМУ виду (только буквы и
+# цифры, нижний регистр), поэтому переживает: лишние пробелы и запятые, регистр,
+# и — главное — пересохранение файла в cp1251, где символ ₴ не существует и Excel
+# заменяет его на «?». Без этого колонка «Цена покупки ₴/шт» после Excel-а
+# перестала бы распознаваться.
+def _norm_header(text):
+    """Заголовок -> только буквы/цифры в нижнем регистре (устойчиво к мусору)."""
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+
 IMPORT_HEADER_MAP = {}
 for _f, _ru in CSV_RAW_COLUMNS:
-    IMPORT_HEADER_MAP[_ru.strip().lower()] = _f
-    IMPORT_HEADER_MAP[_f.strip().lower()] = _f
-IMPORT_HEADER_MAP["uah_per_usd"] = "uah_per_usd"   # старая одно-курсовая схема
-# Терпимость к варианту заголовка с запятой перед единицей («Цена покупки, ₴/шт»):
-# так его может сохранить другая программа или написать человек.
-for _f, _ru in CSV_RAW_COLUMNS:
-    if " " in _ru:
-        _head, _unit = _ru.rsplit(" ", 1)
-        if any(ch in _unit for ch in "₴$%/"):
-            IMPORT_HEADER_MAP[f"{_head}, {_unit}".strip().lower()] = _f
+    IMPORT_HEADER_MAP[_norm_header(_ru)] = _f      # русский заголовок экспорта
+    IMPORT_HEADER_MAP[_norm_header(_f)] = _f       # сырое имя поля (файл «руками»)
+IMPORT_HEADER_MAP.update({
+    # Короткие/старые варианты заголовков — на случай файла, собранного вручную.
+    "uahperusd": "uah_per_usd",                    # устаревшая одно-курсовая схема
+    "название": "item_name",
+    "ценапокупки": "steam_buy_price",
+    "ценапродажи": "site_sell_price",
+    "курспокупки": "buy_uah_per_usd",
+    "курспродажи": "sell_uah_per_usd",
+    "комиссия": "sales_fee_pct",
+    "выгода": "deposit_profit_pct",
+    "группа": "lot_group",
+    "записано": "sold_at",
+})
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024   # 5 МБ — защита от «файла-бомбы»
 MAX_IMPORT_ROWS = 20000              # разумный предел строк
@@ -167,19 +181,45 @@ def _num(value, default):
 
 
 def _to_float(value, default=0.0):
-    """Безопасно приводит к float (NaN/мусор -> default)."""
+    """Безопасно приводит к float (NaN/мусор -> default).
+
+    Понимает десятичную ЗАПЯТУЮ и разделители разрядов: «45,05» -> 45.05,
+    «1 234,56» -> 1234.56, «1,234.56» -> 1234.56. Это не косметика: Excel в
+    украинской/русской локали сохраняет CSV именно так, и без этой обработки
+    введённое число молча превращалось бы в 0.
+
+    NaN и бесконечности (например, текст «NaN» в файле) тоже уходят в default —
+    в базе им не место: они ломают любые последующие суммы и сравнения.
+    """
+    raw = _num(value, default)
+    if isinstance(raw, str):
+        txt = raw.strip().replace("\u00a0", "").replace(" ", "")
+        if "," in txt and "." in txt:
+            txt = txt.replace(",", "")      # запятая = разделитель разрядов
+        elif "," in txt:
+            txt = txt.replace(",", ".")     # запятая = десятичный разделитель
+        raw = txt
     try:
-        return float(_num(value, default))
+        val = float(raw)
     except (TypeError, ValueError):
         return default
+    return val if math.isfinite(val) else default
 
 
 def _to_int(value, default=1):
-    """Безопасно приводит к int (NaN/мусор -> default)."""
-    try:
-        return int(float(_num(value, default)))
-    except (TypeError, ValueError):
+    """Безопасно приводит к int (NaN/мусор -> default).
+
+    Числа разбирает через _to_float, поэтому понимает те же форматы: десятичную
+    запятую («3,0» -> 3) и разделители разрядов. Без этого количество из Excel-CSV
+    украинской локали молча превратилось бы в значение по умолчанию.
+    """
+    raw = _num(value, None)
+    if raw is None:
         return default
+    val = _to_float(raw, float("nan"))
+    if not math.isfinite(val):
+        return default
+    return int(val)
 
 
 def _to_bool(value):
@@ -315,22 +355,34 @@ def _to_iso(value):
     return d.isoformat() if d else ""
 
 
+_CSV_RISKY_PREFIX = ("=", "+", "-", "@")
+
+
+def _csv_needs_quote(text):
+    """Нужно ли защищать ячейку апострофом при выгрузке."""
+    core = text.lstrip("'")
+    return (bool(core) and core[:1] in _CSV_RISKY_PREFIX
+            and text[:1] in _CSV_RISKY_PREFIX + ("'",))
+
+
 def _csv_safe_text(value):
     """Обезвреживает текст перед записью в CSV (защита от инъекции формул).
 
     Excel/LibreOffice исполняют ячейку, начинающуюся с =, +, - или @, как ФОРМУЛУ.
-    Название предмета вводит человек, поэтому перед выгрузкой такие ячейки
-    предваряются апострофом: файл остаётся текстом и ничего не выполняет.
-    Обратная операция (_csv_unquote) делает обмен полностью обратимым.
+    Название вводит человек, поэтому такие ячейки предваряются апострофом: файл
+    остаётся текстом и ничего не выполняет.
+
+    Защищается и имя, которое САМО начинается с апострофа перед опасным символом
+    ("'=x" -> "''=x"): иначе импорт снял бы его апостроф и молча испортил название.
     """
-    s = str(value if value is not None else "")
-    return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+    text = str(value if value is not None else "")
+    return "'" + text if _csv_needs_quote(text) else text
 
 
 def _csv_unquote(value):
-    """Снимает защитный апостроф, добавленный при экспорте (обратимость обмена)."""
-    s = str(value if value is not None else "")
-    return s[1:] if s[:1] == "'" and s[1:2] in ("=", "+", "-", "@") else s
+    """Снимает защитный апостроф, добавленный при экспорте (обмен полностью обратим)."""
+    text = str(value if value is not None else "")
+    return text[1:] if text[:1] == "'" and _csv_needs_quote(text[1:]) else text
 
 
 def now_stamp():
@@ -633,8 +685,9 @@ def _normalize_deal(d):
     legacy = max(0.0, _to_float(d.get("uah_per_usd"), 0.0))
     if buy_rate == 0.0 and legacy > 0:
         buy_rate = legacy
-    if sell_rate == 0.0 and legacy > 0 and sold_flag:
-        sell_rate = legacy
+    # Запасной курс продажи берётся из курса ПОКУПКИ (ниже), а не из устаревшего
+    # единого поля: если в записи есть и явный курс покупки, и legacy-поле, верить
+    # надо явному.
     # Курс продажи заполняем из курса покупки ТОЛЬКО для проданных партий.
     # Обратное (курс покупки из курса продажи) НЕ делаем — см. docstring.
     if sold_flag and sell_rate == 0.0 and buy_rate > 0:
@@ -865,6 +918,37 @@ def _stamp_if_new_sale(row, stamp):
         row["sold_at"] = stamp
 
 
+def _has_sale_data(row):
+    """Есть ли в строке хоть какие-то данные продажи (дата/цена/комиссия/курс)."""
+    return (not _is_blank(row.get("sell_date"))
+            or _to_float(row.get("site_sell_price"), 0.0) > 0
+            or _to_float(row.get("sales_fee_pct"), 0.0) > 0
+            or _to_float(row.get("sell_uah_per_usd"), 0.0) > 0)
+
+
+def sale_data_without_flag(updates, inserts, originals_by_id):
+    """Строки, где заполнены данные продажи, но не отмечено «Продано».
+
+    Такие строки — ловушка: _normalize_deal (по замыслу) очищает поля продажи у
+    открытых партий, поэтому при сохранении введённые цена/дата/комиссия/курс были
+    бы СТЁРТЫ без следа. Возвращаем их названия, чтобы предупредить ДО записи.
+
+    Снятие галочки у ранее проданной партии — осознанное «открыть обратно», такие
+    строки не считаются ошибкой.
+    """
+    bad = []
+    for row in updates:
+        original = originals_by_id.get(row.get("id")) or {}
+        if _to_bool(original.get("sold")):
+            continue                       # партия была продана -> это открытие назад
+        if not _to_bool(row.get("sold")) and _has_sale_data(row):
+            bad.append(str(row.get("item_name") or "").strip() or f"#{row.get('id')}")
+    for row in inserts:
+        if not _to_bool(row.get("sold")) and _has_sale_data(row):
+            bad.append(str(row.get("item_name") or "").strip() or "(новая строка)")
+    return bad
+
+
 def diff_editor_state(original_deals, editor_state, stamp=None):
     """Преобразует состояние st.data_editor в (updates, inserts, delete_ids).
 
@@ -897,7 +981,7 @@ def diff_editor_state(original_deals, editor_state, stamp=None):
     # Streamlit так представляют ПРАВКИ только что добавленных строк), трактуем
     # такую строку как новую вставку, а не отбрасываем её.
     updates = []
-    edited_as_inserts = []
+    edited_beyond = {}      # позиция за пределами исходных строк -> правки
     cleared_delete_ids = []
     for pos, changes in edited.items():
         pos = int(pos)
@@ -914,16 +998,24 @@ def diff_editor_state(original_deals, editor_state, stamp=None):
                 _stamp_if_new_sale(base, stamp)
                 updates.append(base)
         else:
-            # Правка строки за пределами исходных данных = добавленная строка.
-            if _meaningful_row(changes):
-                edited_as_inserts.append(dict(changes))
+            # Правка строки за пределами исходных данных относится к ТОЛЬКО ЧТО
+            # добавленной строке (так это представляют некоторые версии Streamlit).
+            edited_beyond[pos] = dict(changes)
 
-    # Новые строки -> INSERT (с фильтром пустых).
-    inserts = []
-    for row in added:
-        if _meaningful_row(row):
-            inserts.append(row)
-    inserts.extend(edited_as_inserts)
+    # Новые строки -> INSERT. Правки с позициями за пределами исходного списка
+    # НАКЛАДЫВАЮТСЯ на соответствующую добавленную строку, а не вставляются отдельно:
+    # иначе одна и та же новая строка сохранилась бы дважды (и в added, и как правка).
+    added_rows = [dict(row) for row in added]
+    orphan_edits = []
+    for pos, changes in sorted(edited_beyond.items()):
+        idx = pos - len(original_deals)
+        if 0 <= idx < len(added_rows):
+            added_rows[idx].update(changes)
+        else:
+            orphan_edits.append(changes)
+
+    inserts = [row for row in added_rows if _meaningful_row(row)]
+    inserts.extend(row for row in orphan_edits if _meaningful_row(row))
     for row in inserts:
         _stamp_if_new_sale(row, stamp)
 
@@ -1033,6 +1125,44 @@ def validate_deals(deals):
         if dep <= -100.0:
             warnings.append(f"«{name}»: чистый плюс {dep:g}% (≤ −100%) обнуляет себестоимость — "
                             "проверь значение, иначе прибыль и ROI будут неверны.")
+    def _label(deal):
+        name = str(_num(deal.get("item_name"), "") or "").strip() or "(без названия)"
+        return f"#{deal.get('id')} {name}" if deal.get("id") else name
+
+    # Количество < 1: такая строка исключается из ВСЕХ расчётов, и без явного
+    # предупреждения её легко не заметить в журнале.
+    for d in deals:
+        if _to_int(d.get("quantity"), 0) < 1:
+            warnings.append(f"{_label(d)}: количество меньше 1 — строка не участвует в расчётах.")
+
+    # Открытая партия без даты покупки: дата нужна и для холда, и для сверки.
+    for d in deals:
+        if not _to_bool(d.get("sold")) and _to_iso(d.get("buy_date")) == "":
+            warnings.append(f"{_label(d)}: открытая партия без даты покупки.")
+
+    # Расхождения внутри одной покупки: сверка показывает данные ПЕРВОЙ партии группы,
+    # поэтому опечатка в одной из частей молча маскируется.
+    groups = {}
+    for d in deals:
+        gid = str(_num(d.get("lot_group"), "") or "").strip()
+        if gid:
+            groups.setdefault(gid, []).append(d)
+    for gid, members in groups.items():
+        if len(members) < 2:
+            continue
+        for field, title in (("item_name", "названию"), ("buy_date", "дате покупки"),
+                             ("steam_buy_price", "цене покупки"),
+                             ("deposit_profit_pct", "выгоде пополнения"),
+                             ("buy_uah_per_usd", "курсу покупки")):
+            if field in ("item_name", "buy_date"):
+                values = {str(_num(x.get(field), "") or "").strip() for x in members}
+            else:
+                values = {round(_to_float(x.get(field)), 2) for x in members}
+            if len(values) > 1:
+                warnings.append(
+                    f"Партии одной покупки (группа {gid}) расходятся по {title}: "
+                    f"{sorted(str(v) for v in values)}. Сверка покажет только первое значение.")
+
     return warnings
 
 
@@ -1141,6 +1271,11 @@ def build_dataframe(deals):
         # него долларовая себестоимость = 0, и profit_usd был бы завышен (вся
         # выручка). Гривневую прибыль показываем всегда (она от курса не зависит).
         usd_defined = complete_sale and _to_float(d.get("buy_uah_per_usd")) > 0
+        # ₴-прибыль имеет смысл только если известен ХОТЬ КАКОЙ-ТО курс: без курса
+        # выручка в ₴ = 0, и журнал показывал бы «убыток на всю себестоимость» (ROI
+        # -100%) там, где на самом деле просто нет данных.
+        uah_defined = complete_sale and (_to_float(d.get("sell_uah_per_usd")) > 0
+                                         or _to_float(d.get("buy_uah_per_usd")) > 0)
         # Некорректное количество (<1) исключаем из ВСЕХ расчётных колонок: иначе журнал
         # показал бы себестоимость/прибыль, посчитанную по форсированному количеству 1
         # (compute_deal), тогда как сводка такую строку исключает. Так journal и сводка
@@ -1161,9 +1296,9 @@ def build_dataframe(deals):
             "sales_fee_pct": _to_float(d.get("sales_fee_pct")),
             "sell_uah_per_usd": _to_float(d.get("sell_uah_per_usd")),
             "real_cost_uah": round(calc["real_cost_uah"], 2) if qty_ok else None,
-            "profit_uah": round(calc["profit_uah"], 2) if (complete_sale and qty_ok) else None,
+            "profit_uah": round(calc["profit_uah"], 2) if (uah_defined and qty_ok) else None,
             "profit_usd": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
-            "roi_pct": round(roi, 1) if (complete_sale and roi is not None and qty_ok) else None,
+            "roi_pct": round(roi, 1) if (uah_defined and roi is not None and qty_ok) else None,
             "holding_days": holding_days(d.get("buy_date"), d.get("sell_date")),
             "status": status,
         })
@@ -1285,24 +1420,40 @@ def parse_import_csv(data):
         return [], {"error": "Файл пустой."}
     if len(data) > MAX_IMPORT_BYTES:
         return [], {"error": f"Файл больше {MAX_IMPORT_BYTES // (1024 * 1024)} МБ — импорт отклонён."}
-    try:
-        df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False,
-                         encoding="utf-8-sig")
-    except Exception as exc:
-        return [], {"error": f"Не удалось прочитать CSV: {exc}"}
+    # Excel в украинской/русской локали сохраняет CSV в cp1251 и с разделителем «;».
+    # Жёсткая привязка к utf-8 и запятой ломала бы импорт такого файла целиком,
+    # поэтому пробуем обе кодировки, а разделитель определяем автоматически
+    # (sep=None + engine="python" — распознаёт «,», «;», табуляцию).
+    df, last_error = None, None
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False,
+                             encoding=encoding, sep=None, engine="python")
+            break
+        except Exception as exc:
+            last_error = exc
+    if df is None:
+        return [], {"error": f"Не удалось прочитать CSV: {last_error}"}
     if len(df) > MAX_IMPORT_ROWS:
         return [], {"error": f"Слишком много строк ({len(df)}), предел — {MAX_IMPORT_ROWS}."}
 
     mapping = {}
     for col in df.columns:
-        field = IMPORT_HEADER_MAP.get(str(col).strip().lower())
+        field = IMPORT_HEADER_MAP.get(_norm_header(col))
         if field:
             mapping[col] = field
     if not ({"item_name", "buy_date", "steam_buy_price"} & set(mapping.values())):
         return [], {"error": "В файле нет колонок журнала (нужны «Предмет», «Дата покупки» "
                              "или «Цена покупки»). Похоже, это не файл экспорта."}
 
-    rows, skipped = [], 0
+    # Если колонки количества в файле нет вовсе — это одна штука на строку, а не ноль:
+    # с нулём каждая запись оказалась бы «битой» и выпала из всех расчётов.
+    has_qty_column = "quantity" in set(mapping.values())
+    extra_warnings = []
+    if not has_qty_column:
+        extra_warnings.append("В файле нет колонки количества — принято по 1 шт. на строку.")
+
+    rows, skipped, unflagged = [], 0, []
     for _idx, r in df.iterrows():
         raw = {}
         for col, field in mapping.items():
@@ -1310,20 +1461,32 @@ def parse_import_csv(data):
             if field in ("item_name", "lot_group", "sold_at"):
                 val = _csv_unquote(val)
             raw[field] = val
+        if not has_qty_column:
+            raw["quantity"] = 1
         if not _meaningful_row(raw):
             skipped += 1
             continue
+        # Проверяем ДО нормализации: у неотмеченной как проданная строки поля продажи
+        # будут очищены, и пользователь должен знать об этом заранее.
+        if not _to_bool(raw.get("sold")) and _has_sale_data(raw):
+            unflagged.append(str(raw.get("item_name") or "").strip() or "(без названия)")
         row = _normalize_deal(raw)
         rid = _to_int(raw.get("id"), 0)
         if rid > 0:
             row["id"] = rid
         rows.append(row)
 
+    if unflagged:
+        extra_warnings.append(
+            f"У {len(unflagged)} строк заполнены данные продажи, но не стоит «Продано» — "
+            f"эти поля при импорте будут очищены: {', '.join(unflagged[:10])}"
+            + ("…" if len(unflagged) > 10 else ""))
+
     report = {
         "total": int(len(df)),
         "ready": len(rows),
         "skipped": skipped,
-        "warnings": validate_deals(rows),
+        "warnings": extra_warnings + validate_deals(rows),
         "ignored_columns": [str(c) for c in df.columns if c not in mapping],
     }
     return rows, report
@@ -1433,6 +1596,9 @@ def sale_row(d):
     complete = price > 0 and sell_d is not None
     qty_ok = qty >= 1
     usd_defined = complete and buy_rate > 0
+    # Без курса (ни продажи, ни покупки) гривневая выручка неизвестна: показывать
+    # «убыток на всю себестоимость» нельзя — это ложь, а не результат сделки.
+    uah_defined = complete and (sell_rate_raw > 0 or buy_rate > 0)
     roi = calc["roi_pct"]
     return {
         "Предмет": str(d.get("item_name") or "").strip() or "(без названия)",
@@ -1442,8 +1608,8 @@ def sale_row(d):
         "Цена продажи, $/шт": round(price, 2) if price > 0 else None,
         "Выручка, $": round(calc["revenue_usd"], 2) if (complete and qty_ok) else None,
         "Прибыль, $": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
-        "Прибыль, ₴": round(calc["profit_uah"], 2) if (complete and qty_ok) else None,
-        "ROI, %": round(roi, 1) if (complete and qty_ok and roi is not None) else None,
+        "Прибыль, ₴": round(calc["profit_uah"], 2) if (uah_defined and qty_ok) else None,
+        "ROI, %": round(roi, 1) if (uah_defined and qty_ok and roi is not None) else None,
         "Курс продажи": round(sell_rate_raw, 2) if sell_rate_raw > 0 else None,
         "Статус": "Закрыта" if complete else "Закрыта (неполная)",
     }
@@ -1537,6 +1703,10 @@ def render_purchase():
         sold_now = st.checkbox("Часть или всё уже продано", value=False, key="buy_sold_now",
                                help="Включи, если оформляешь уже завершённую сделку. "
                                     "Иначе продажу можно записать позже в «Продать из остатков».")
+        # Streamlit падает, если значение в session_state больше нового max_value
+        # (уменьшили купленное количество, а «сколько продано» осталось прежним).
+        if _to_int(st.session_state.get("buy_qty_sold"), 0) > int(qty_bought):
+            st.session_state["buy_qty_sold"] = int(qty_bought)
         qty_sold = st.number_input("Сколько продано", min_value=0, max_value=int(qty_bought),
                                    value=int(qty_bought), step=1, key="buy_qty_sold", disabled=not sold_now)
         sell_d = st.date_input("Дата продажи", value=date.today(), key="buy_sell_date",
@@ -1672,12 +1842,19 @@ def render_sell_from_holdings(deals):
             updates, inserts, dels = replace_lot_with_sale(
                 deals, selected_id, int(sell_qty), _to_iso(sell_d),
                 float(site_price), float(sales_fee), float(sell_rate))
-            apply_changes(updates, inserts, dels)
+            # Пустой результат = партия не найдена или уже продана (её могли изменить
+            # в другой вкладке). Тогда писать нечего и «успех» показывать нельзя.
+            if updates:
+                apply_changes(updates, inserts, dels)
         except Exception as e:
             st.error(f"Не удалось записать продажу: {e}. Данные не изменены — попробуй ещё раз.")
         else:
-            st.success("Продажа записана.")
-            st.rerun()
+            if not updates:
+                st.warning("Продажа не записана: партия не найдена или уже продана. "
+                           "Обнови страницу и попробуй снова.")
+            else:
+                st.success("Продажа записана.")
+                st.rerun()
 
 
 # ===========================================================================
@@ -1842,7 +2019,15 @@ def render_ledger(deals):
             # Диффим относительно ОТОБРАЖАЕМОГО среза в том же порядке — привязка
             # позиция->id остаётся верной даже при поиске и сортировке.
             updates, inserts, dels = diff_editor_state(view_deals, state)
-            if not updates and not inserts and not dels:
+            # ЗАЩИТА ОТ МОЛЧАЛИВОЙ ПОТЕРИ ДАННЫХ: заполнены поля продажи, но галочка
+            # «Продано» не стоит -> при записи они были бы стёрты. Не сохраняем.
+            unflagged = sale_data_without_flag(updates, inserts,
+                                               {d.get("id"): d for d in view_deals})
+            if unflagged:
+                st.error("Не сохранено: у этих строк заполнены данные продажи, но не отмечено "
+                         "«Продано» — иначе они были бы стёрты. Поставь галочку или очисти "
+                         "поля продажи: " + ", ".join(unflagged))
+            elif not updates and not inserts and not dels:
                 st.info("Нет изменений для сохранения.")
             else:
                 # Защита от повторного применения одного и того же набора правок
@@ -1943,16 +2128,22 @@ def render_summary(deals):
     bad_qty = df[sold_mask & has_price & has_date & ~valid_qty]
     open_pos = df[~sold_mask & valid_qty]
 
-    realized_profit_uah = float(closed["profit_uah"].fillna(0).sum()) if not closed.empty else 0.0
+    # ₴-итоги — ТОЛЬКО по продажам с известным курсом (profit_uah не пуст). Иначе
+    # сделка без курсов внесла бы в сумму «убыток на всю себестоимость» и занизила
+    # общий ROI, хотя на деле по ней просто нет данных.
+    closed_uah = closed[closed["profit_uah"].notna()]
+    realized_profit_uah = float(closed_uah["profit_uah"].sum()) if not closed_uah.empty else 0.0
     realized_profit_usd = float(closed_usd["profit_usd"].fillna(0).sum()) if not closed_usd.empty else 0.0
-    closed_cost_uah = float(closed["real_cost_uah"].fillna(0).sum()) if not closed.empty else 0.0
+    closed_cost_uah = float(closed_uah["real_cost_uah"].fillna(0).sum()) if not closed_uah.empty else 0.0
     open_cost_uah = float(open_pos["real_cost_uah"].fillna(0).sum()) if not open_pos.empty else 0.0
     overall_roi = (realized_profit_uah / closed_cost_uah * 100.0) if closed_cost_uah > 0 else None
-    wins = int((closed["profit_uah"].fillna(0) > 0).sum()) if not closed.empty else 0
-    win_rate = (wins / len(closed) * 100.0) if len(closed) > 0 else 0.0
+    wins = int((closed_uah["profit_uah"] > 0).sum()) if not closed_uah.empty else 0
+    win_rate = (wins / len(closed_uah) * 100.0) if len(closed_uah) > 0 else 0.0
     qty_open = int(open_pos["quantity"].sum()) if not open_pos.empty else 0
     # Сколько закрытых продаж без курса покупки (их $-прибыль не учтена).
     no_rate_count = int(len(closed) - len(closed_usd))
+    # Сколько закрытых продаж вообще без курсов (не учтены и в ₴-итогах).
+    no_uah_rate_count = int(len(closed) - len(closed_uah))
 
     m1, m2, m3 = st.columns(3)
     # ROI не определён при нулевой себестоимости (например, бесплатные дропы): показываем
@@ -1968,6 +2159,9 @@ def render_summary(deals):
     if no_rate_count > 0:
         usd_note += f" (без {no_rate_count} партий без курса покупки)"
     m1.caption(usd_note)
+    if no_uah_rate_count > 0:
+        m1.caption(f"⚠️ {no_uah_rate_count} закрытых партий вообще без курсов — они не учтены "
+                   "и в гривневых итогах (иначе дали бы ложный убыток). Впиши курс в журнале.")
     m2.metric("В остатках на руках", f"{open_cost_uah:,.2f} ₴")
     m2.caption(f"{qty_open} шт в {len(open_pos)} открытых партиях")
     m3.metric("Доля прибыльных", f"{win_rate:.0f}%")
@@ -2001,19 +2195,27 @@ def render_summary(deals):
 
 def _run_import(rows, mode):
     """Безопасный запуск импорта: сначала резервная копия, затем запись одной
-    транзакцией. Если бэкап не удался — импорт вообще не начинается."""
+    транзакцией. Если копию сделать не удалось — импорт НЕ начинается.
+
+    make_backup возвращает ПАРУ (status, path), а не путь: раньше здесь пара
+    принималась за путь, и Path((status, path)) валился с TypeError — импорт падал
+    при каждом запуске. Теперь пара распаковывается, а статус проверяется.
+    """
     try:
-        backup_path = make_backup(force=True, manual=True)
+        status, backup_path = make_backup(force=True, manual=True)
     except Exception as exc:
         st.error(f"Не удалось создать резервную копию — импорт отменён, база не тронута: {exc}")
+        return
+    if status == "error" or backup_path is None:
+        st.error("Импорт отменён: не удалось создать резервную копию. Проверь папку backups "
+                 "и свободное место — без копии перезаписывать базу нельзя.")
         return
     try:
         written = import_deals(rows, mode=mode)
     except Exception as exc:
         st.error(f"Импорт не выполнен, база осталась прежней (откат транзакции): {exc}")
         return
-    note = f" · резервная копия: {Path(backup_path).name}" if backup_path else ""
-    st.success(f"Импортировано строк: {written}{note}")
+    st.success(f"Импортировано строк: {written} · резервная копия: {backup_path.name}")
     st.rerun()
 
 
@@ -2101,12 +2303,20 @@ def render_export(deals):
                            file_name="steam_ledger.csv", mime="text/csv",
                            use_container_width=True)
     with col_xlsx:
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export_df.to_excel(writer, index=False, sheet_name="Сделки")
-        st.download_button("⬇️ Скачать Excel", data=buffer.getvalue(), file_name="steam_ledger.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+        # openpyxl — необязательная зависимость pandas. Если её нет, кнопка Excel не
+        # должна ронять приложение: показываем подсказку, а CSV продолжает работать.
+        try:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                export_df.to_excel(writer, index=False, sheet_name="Сделки")
+        except ImportError:
+            st.button("⬇️ Скачать Excel", disabled=True, use_container_width=True,
+                      help="Нужен пакет openpyxl: pip install openpyxl")
+        else:
+            st.download_button("⬇️ Скачать Excel", data=buffer.getvalue(),
+                               file_name="steam_ledger.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
     st.caption("CSV — полный формат обмена (сырые поля + расчётные колонки; расчётные "
                "при импорте игнорируются и пересчитываются). Excel — только для просмотра, "
                "импортировать его нельзя.")
@@ -2216,17 +2426,19 @@ def render_delete(deals):
                      key="delete_confirm", use_container_width=True):
             try:
                 status, path = make_backup(force=True, manual=True)
-                apply_changes([], [], [chosen_id])
+                # Удаление необратимо: без свежей копии не удаляем вовсе.
+                if status != "error" and path is not None:
+                    apply_changes([], [], [chosen_id])
             except Exception as e:
                 st.error(f"Не удалось удалить партию: {e}. Данные не изменены — попробуй ещё раз.")
             else:
-                st.session_state.pop("pending_delete_id", None)
-                if status == "created":
-                    st.toast(f"Партия #{chosen_id} удалена. Бэкап: {path.name}", icon="🗑️")
+                if status == "error" or path is None:
+                    st.error("Удаление отменено: не удалось создать резервную копию. "
+                             "Проверь папку backups и свободное место, затем попробуй снова.")
                 else:
-                    st.toast(f"Партия #{chosen_id} удалена (резервную копию создать не удалось)",
-                             icon="⚠️")
-                st.rerun()
+                    st.session_state.pop("pending_delete_id", None)
+                    st.toast(f"Партия #{chosen_id} удалена. Бэкап: {path.name}", icon="🗑️")
+                    st.rerun()
     with c_no:
         if st.button("Отмена", key="delete_cancel", use_container_width=True):
             st.session_state.pop("pending_delete_id", None)
