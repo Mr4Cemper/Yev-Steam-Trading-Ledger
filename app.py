@@ -68,7 +68,7 @@ BACKUP_KEEP_MANUAL = 4           # сколько последних ручны�
 BACKUP_PREFIX = "deals.db."      # имя копии: deals.db.YYYY-MM-DD.bak
 BACKUP_SUFFIX = ".bak"
 
-DEFAULT_DEPOSIT_PROFIT = 48.0   # чистый плюс пополнения Steam, %
+DEFAULT_DEPOSIT_PROFIT = 48.0   # чистый плюс пополнения Steam по умолчанию, %
 DEFAULT_SALES_FEE = 2.0         # комиссия сайта за продажу, %
 DEFAULT_RATE = 45.05            # сколько ₴ в 1 $
 
@@ -107,7 +107,7 @@ CSV_RAW_COLUMNS = [
     ("buy_date",           "Дата покупки"),
     ("steam_buy_price",    "Цена покупки ₴/шт"),
     ("quantity",           "Количество"),
-    ("deposit_profit_pct", "Выгода пополнения %"),
+    ("deposit_profit_pct", "Чистый плюс пополнения, %"),
     ("buy_uah_per_usd",    "Курс покупки ₴/$"),
     ("sold",               "Продано"),
     ("sell_date",          "Дата продажи"),
@@ -151,6 +151,11 @@ IMPORT_HEADER_MAP.update({
     "курспродажи": "sell_uah_per_usd",
     "комиссия": "sales_fee_pct",
     "выгода": "deposit_profit_pct",
+    "чистыйплюс": "deposit_profit_pct",
+    "чистыйплюспополнения": "deposit_profit_pct",
+    # Старый заголовок из файлов, выгруженных до переименования колонки, — чтобы
+    # ранее сохранённые CSV по-прежнему импортировались без правки вручную.
+    "выгодапополнения": "deposit_profit_pct",
     "группа": "lot_group",
     "записано": "sold_at",
 })
@@ -202,15 +207,14 @@ def _to_float(value, default=0.0):
             else:
                 txt = txt.replace(",", "")
         elif "," in txt:
-            head, _sep, tail = txt.rpartition(",")
-            # Ровно три цифры после единственной запятой при цифрах перед ней — это
-            # разряды («1,250» = 1250), а не дробь. Иначе запятая десятичная
-            # («100,50» -> 100.5) — так пишет Excel в украинской локали.
-            if (len(tail) == 3 and tail.isdigit()
-                    and head.replace(",", "").lstrip("-").isdigit()):
-                txt = txt.replace(",", "")
-            else:
-                txt = txt.replace(",", ".")
+            # Одиночная запятая — ДЕСЯТИЧНЫЙ разделитель («100,50» -> 100.5, «1,2» -> 1.2):
+            # так пишет Excel в украинской/русской локали. Единственное исключение —
+            # НЕСКОЛЬКО групп ровно по 3 цифры («1,234,567»): это разряды. Одну группу
+            # из 3 цифр как разряды не трактуем — иначе цена «1,200» (= 1.2) стала бы 1200.
+            groups = txt.lstrip("-").split(",")
+            is_thousns = (len(groups) >= 3 and groups[0].isdigit() and 1 <= len(groups[0]) <= 3
+                          and all(len(g) == 3 and g.isdigit() for g in groups[1:]))
+            txt = txt.replace(",", "") if is_thousns else txt.replace(",", ".")
         raw = txt
     try:
         val = float(raw)
@@ -1169,25 +1173,21 @@ def validate_deals(deals):
             warnings.append(f"«{name}»: отрицательная цена покупки.")
         if _to_float(d.get("site_sell_price")) < 0:
             warnings.append(f"«{name}»: отрицательная цена продажи.")
+        # Комиссия вне диапазона. Для >100% сообщение подробнее (в расчёте она
+        # урезается до 100%), для <0 — короткое. Второй проверки ниже нет — во
+        # избежание дублирующего предупреждения.
         fee = _to_float(d.get("sales_fee_pct"))
-        if fee < 0 or fee > 100:
-            warnings.append(f"«{name}»: комиссия продажи вне диапазона 0–100% ({fee:g}%).")
+        if fee > 100.0:
+            warnings.append(f"«{name}»: комиссия {fee:g}% больше 100% — в расчёте используется "
+                            "100% (выручка обнуляется). Похоже на опечатку.")
+        elif fee < 0:
+            warnings.append(f"«{name}»: отрицательная комиссия продажи ({fee:g}%).")
         # Чистый плюс -100% и ниже делает множитель (1 + плюс/100) нулевым или
         # отрицательным, и реальная стоимость обнуляется — отчёты исказятся.
         dep = _to_float(d.get("deposit_profit_pct"))
         if dep <= -100.0:
             warnings.append(f"«{name}»: чистый плюс {dep:g}% (≤ −100%) обнуляет себестоимость — "
                             "проверь значение, иначе прибыль и ROI будут неверны.")
-    # Комиссия > 100% сохраняется как есть (данные пользователя не подменяем), но в
-    # расчёте compute_deal она урезается до 100%. Без предупреждения это расхождение
-    # было бы незаметным.
-    for d in deals:
-        fee = _to_float(d.get("sales_fee_pct"), 0.0)
-        if fee > 100.0:
-            name = str(_num(d.get("item_name"), "") or "").strip() or "(без названия)"
-            warnings.append(f"«{name}»: комиссия {fee:g}% больше 100% — в расчёте "
-                            f"используется 100% (выручка обнуляется). Похоже на опечатку.")
-
     def _label(deal):
         name = str(_num(deal.get("item_name"), "") or "").strip() or "(без названия)"
         return f"#{deal.get('id')} {name}" if deal.get("id") else name
@@ -1215,7 +1215,7 @@ def validate_deals(deals):
             continue
         for field, title in (("item_name", "названию"), ("buy_date", "дате покупки"),
                              ("steam_buy_price", "цене покупки"),
-                             ("deposit_profit_pct", "выгоде пополнения"),
+                             ("deposit_profit_pct", "чистому плюсу пополнения"),
                              ("buy_uah_per_usd", "курсу покупки")):
             if field in ("item_name", "buy_date"):
                 values = {str(_num(x.get(field), "") or "").strip() for x in members}
@@ -1274,7 +1274,7 @@ def reconcile_purchases(deals):
             "Предмет": v["name"] or "—",
             "Куплено": v["buy_date"] or "—",
             "Цена закупки, ₴": v["price"],
-            "Чистый плюс, %": v["dep"],
+            "Чистый плюс пополнения, %": v["dep"],
             "Курс покупки": v["brate"],
             "Продано": v["sold"],
             "На руках": v["open"],
@@ -1362,7 +1362,10 @@ def build_dataframe(deals):
             "profit_uah": round(calc["profit_uah"], 2) if (uah_defined and qty_ok) else None,
             "profit_usd": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
             "roi_pct": round(roi, 1) if (uah_defined and roi is not None and qty_ok) else None,
-            "holding_days": holding_days(d.get("buy_date"), d.get("sell_date")),
+            # Для проданной партии без даты продажи срок удержания неизвестен: считать
+            # «до сегодня» нельзя (предмет уже продан), поэтому — пусто, а не растущее число.
+            "holding_days": (None if (sold and sell_date_val is None)
+                             else holding_days(d.get("buy_date"), d.get("sell_date"))),
             "status": status,
         })
 
@@ -1387,7 +1390,10 @@ def column_config():
         "buy_date": st.column_config.DateColumn("Дата покупки", format="YYYY-MM-DD"),
         "steam_buy_price": st.column_config.NumberColumn("Покупка в Steam, ₴", min_value=0.0, step=0.01, format="%.2f"),
         "quantity": st.column_config.NumberColumn("Кол-во", min_value=1, step=1, format="%d"),
-        "deposit_profit_pct": st.column_config.NumberColumn("Чистый плюс, %", min_value=-99.9, step=0.01, format="%.2f"),
+        "deposit_profit_pct": st.column_config.NumberColumn(
+            "Чистый плюс пополнения, %", min_value=-99.9, step=0.01, format="%.2f",
+            help="Насколько выгоднее пополнить баланс Steam, чем платить напрямую. "
+                 "Потратил 10, получил 15 на баланс → 50%. Уменьшает себестоимость предмета."),
         "buy_uah_per_usd": st.column_config.NumberColumn("Курс покупки ₴/$", min_value=0.0, step=0.01, format="%.2f"),
         "sold": st.column_config.CheckboxColumn("Продано"),
         "sell_date": st.column_config.DateColumn("Дата продажи", format="YYYY-MM-DD"),
@@ -1397,7 +1403,10 @@ def column_config():
         "real_cost_uah": st.column_config.NumberColumn("Реальная стоимость, ₴", format="%.2f"),
         "profit_uah": st.column_config.NumberColumn("Прибыль, ₴", format="%.2f"),
         "profit_usd": st.column_config.NumberColumn("Прибыль, $", format="%.2f"),
-        "roi_pct": st.column_config.NumberColumn("ROI, %", format="%.1f"),
+        "roi_pct": st.column_config.NumberColumn(
+            "ROI ₴, %", format="%.1f",
+            help="Доходность в гривне: прибыль ₴ ÷ реальная стоимость ₴. При девальвации "
+                 "растёт, даже если долларовая доходность нулевая."),
         "holding_days": st.column_config.NumberColumn("Дней", format="%d"),
         "status": st.column_config.TextColumn("Статус"),
     }
@@ -1672,7 +1681,7 @@ def sale_row(d):
         "Выручка, $": round(calc["revenue_usd"], 2) if (complete and qty_ok) else None,
         "Прибыль, $": round(calc["profit_usd"], 2) if (usd_defined and qty_ok) else None,
         "Прибыль, ₴": round(calc["profit_uah"], 2) if (uah_defined and qty_ok) else None,
-        "ROI, %": round(roi, 1) if (uah_defined and qty_ok and roi is not None) else None,
+        "ROI ₴, %": round(roi, 1) if (uah_defined and qty_ok and roi is not None) else None,
         "Курс продажи": round(sell_rate_raw, 2) if sell_rate_raw > 0 else None,
         "Статус": "Закрыта" if complete else "Закрыта (неполная)",
     }
@@ -1753,10 +1762,12 @@ def render_purchase():
         steam_price = st.number_input("Цена покупки в Steam, ₴ (за 1 шт.)",
                                       min_value=0.0, value=0.0, step=0.01, format="%.2f", key="buy_price")
         qty_bought = st.number_input("Сколько куплено", min_value=1, value=1, step=1, key="buy_qty")
-        deposit_profit = st.number_input("Чистый плюс пополнения Steam, %",
+        deposit_profit = st.number_input("Чистый плюс пополнения, %",
                                          min_value=-99.9, value=DEFAULT_DEPOSIT_PROFIT,
                                          step=0.01, format="%.2f", key="buy_deposit",
-                                         help="Потратил 10, получил 15 на баланс → 50%.")
+                                         help="Насколько выгоднее пополнить баланс Steam, чем платить "
+                                              "напрямую. Потратил 10, получил 15 на баланс → 50%. "
+                                              "Уменьшает себестоимость предмета.")
         buy_rate = st.number_input("Курс на момент покупки: ₴ в 1 $",
                                    min_value=0.01, value=DEFAULT_RATE, step=0.01, format="%.2f", key="buy_rate",
                                    help="Фиксирует долларовую себестоимость. Не меняется при будущих продажах.")
@@ -2232,6 +2243,17 @@ def render_summary(deals):
     closed_cost_uah = float(closed_uah["real_cost_uah"].fillna(0).sum()) if not closed_uah.empty else 0.0
     open_cost_uah = float(open_pos["real_cost_uah"].fillna(0).sum()) if not open_pos.empty else 0.0
     overall_roi = (realized_profit_uah / closed_cost_uah * 100.0) if closed_cost_uah > 0 else None
+    # Долларовый ROI — по закрытым продажам с курсом покупки. Он показывает реальную
+    # доходность в долларах: гривневый ROI при девальвации завышается (та же сделка в
+    # $0 прибыли выглядит как плюс, потому что гривна подешевела). Долларовая
+    # себестоимость = выручка − прибыль (в $), по определению compute_deal.
+    if closed_usd.empty:
+        overall_roi_usd = None
+    else:
+        cost_usd_series = (closed_usd["real_cost_uah"].fillna(0)
+                           / closed_usd["buy_uah_per_usd"].replace(0, pd.NA))
+        closed_cost_usd = float(cost_usd_series.fillna(0).sum())
+        overall_roi_usd = (realized_profit_usd / closed_cost_usd * 100.0) if closed_cost_usd > 0 else None
     wins = int((closed_uah["profit_uah"] > 0).sum()) if not closed_uah.empty else 0
     win_rate = (wins / len(closed_uah) * 100.0) if len(closed_uah) > 0 else 0.0
     qty_open = int(open_pos["quantity"].sum()) if not open_pos.empty else 0
@@ -2244,16 +2266,22 @@ def render_summary(deals):
     # ROI не определён при нулевой себестоимости (например, бесплатные дропы): показываем
     # «н/д», а не обманчивые 0%. Если закрытых продаж нет вовсе — дельту не показываем.
     if overall_roi is not None:
-        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴", delta=f"{overall_roi:+.1f}% ROI")
+        m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴", delta=f"{overall_roi:+.1f}% ROI ₴")
     elif not closed.empty:
         m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴",
                   delta="ROI н/д (себестоимость 0)", delta_color="off")
     else:
         m1.metric("Реализованная прибыль", f"{realized_profit_uah:,.2f} ₴")
     usd_note = f"≈ {realized_profit_usd:,.2f} $"
+    if overall_roi_usd is not None:
+        usd_note += f" · ROI в $: {overall_roi_usd:+.1f}%"
     if no_rate_count > 0:
         usd_note += f" (без {no_rate_count} партий без курса покупки)"
     m1.caption(usd_note)
+    if overall_roi is not None and overall_roi_usd is not None:
+        m1.caption("ROI ₴ и ROI $ расходятся на величину изменения курса гривны: "
+                   "гривневый растёт при девальвации, долларовый показывает чистую "
+                   "доходность в валюте продажи.")
     if no_uah_rate_count > 0:
         m1.caption(f"⚠️ {no_uah_rate_count} закрытых партий вообще без курсов — они не учтены "
                    "и в гривневых итогах (иначе дали бы ложный убыток). Впиши курс в журнале.")
