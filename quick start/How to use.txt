@@ -1,0 +1,29 @@
+RU
+--------------
+
+Батники для быстрого запуска(не забываем перед этим установить "requirements" а так же в каждом файле установить коректный путь к файлу, в случае их остутствия должно выдать ошибку) 
+
+SteamLedgerChrome.bat - быстрый запуск именно под Google Chrome бразуер (установите в батнике путь к файлу)
+
+SteamLedgerDef.bat - быстрый запуск под стандартый бразуер (тот что у вас обазначен как по дефолту) (установите в батнике путь к файлу)
+
+SteamLedgerUniversal.bat - универсальный быстрый запуск, положите батник в КОРЕНЬ проекта
+
+все три батника рабочие(наверно), рекомендую по стандарту "SteamLedgerDef.bat"
+
+напоминаю что этот проект создан для личного использования (сильно узко направлен)
+
+EN
+--------------
+
+Quick launch batch files (don't forget to set "requirements" beforehand and also set the correct file path in each file; if they are missing, an error should be thrown)
+
+SteamLedgerChrome.bat - quick launch specifically for the Google Chrome browser (set the file path in the batch file)
+
+SteamLedgerDef.bat - quick launch for the standard browser (the one you set as default) (set the file path in the batch file)
+
+SteamLedgerUniversal.bat - universal quick launch, place the batch file in the ROOT of the project
+
+All three batch files are probably working, I recommend the standard "SteamLedgerDef.bat"
+
+I remind you that this project was created for personal use (very narrowly focused).
